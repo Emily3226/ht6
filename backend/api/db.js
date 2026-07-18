@@ -1,4 +1,27 @@
-const { MongoClient } = require('mongodb');
+const { MongoClient, ObjectId } = require('mongodb');
+
+// Minimal EJSON support: clients built against the old Atlas Data API send
+// {"$oid": "..."} for ObjectIds and {"$date": {"$numberLong": "ms"}} for
+// dates. The plain Node driver would store/match those as literal nested
+// objects, so convert them to real ObjectId/Date values recursively.
+function fromEJSON(value) {
+    if (Array.isArray(value)) return value.map(fromEJSON);
+    if (value && typeof value === 'object') {
+        const keys = Object.keys(value);
+        if (keys.length === 1 && keys[0] === '$oid' && typeof value.$oid === 'string') {
+            try { return new ObjectId(value.$oid); } catch { return value.$oid; }
+        }
+        if (keys.length === 1 && keys[0] === '$date') {
+            const raw = value.$date;
+            const ms = raw && typeof raw === 'object' ? Number(raw.$numberLong) : Number(new Date(raw));
+            if (!Number.isNaN(ms)) return new Date(ms);
+        }
+        const out = {};
+        for (const key of keys) out[key] = fromEJSON(value[key]);
+        return out;
+    }
+    return value;
+}
 
 let _client = null;
 let _jwks = null;
@@ -86,7 +109,10 @@ module.exports = async (req, res) => {
             return res.status(401).json({ error: `Invalid Auth0 token: ${err.message}` });
         }
     } else {
-        const apiKey = req.headers['api-key'];
+        // Accept both header spellings: 'api-key' (AtlasClient) and
+        // 'apiKey' (SOSManager's Data-API-style wrapper; Node lowercases
+        // it to 'apikey').
+        const apiKey = req.headers['api-key'] || req.headers['apikey'];
         if (!apiKey || apiKey !== process.env.API_KEY) {
             return res.status(401).json({ error: 'Unauthorized' });
         }
@@ -116,7 +142,7 @@ module.exports = async (req, res) => {
 
         switch (action) {
             case 'insertOne': {
-                const result = await col.insertOne(scopeDoc(rest.document, authedUserId));
+                const result = await col.insertOne(fromEJSON(scopeDoc(rest.document, authedUserId)));
                 return res.json({ insertedId: result.insertedId.toString() });
             }
             case 'insertMany': {
@@ -139,6 +165,18 @@ module.exports = async (req, res) => {
                 const pipeline = scopePipeline(rest.pipeline || [], authedUserId);
                 const documents = await col.aggregate(pipeline).toArray();
                 return res.json({ documents });
+            }
+            case 'updateOne': {
+                const result = await col.updateOne(
+                    fromEJSON(scopeFilter(rest.filter, authedUserId)),
+                    fromEJSON(rest.update),
+                    { upsert: rest.upsert ?? false }
+                );
+                return res.json({
+                    matchedCount: result.matchedCount,
+                    modifiedCount: result.modifiedCount,
+                    upsertedId: result.upsertedId?.toString() ?? null
+                });
             }
             case 'replaceOne': {
                 const result = await col.replaceOne(

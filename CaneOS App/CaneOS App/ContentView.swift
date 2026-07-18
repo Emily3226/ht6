@@ -66,10 +66,10 @@ struct ContentView: View {
     @State private var cameraStatus: CameraStatusEvent?
     @State private var isScanning          = false
     @State private var isHardwareConnected = false
-    @State private var sosCountdown: Int?  = nil
-    @State private var sosTask: Task<Void, Never>?
     @State private var sosErrorMessage: String?
     @State private var pendingSOSIncidentId: UUID?
+    @State private var lastSOSAt: Date?
+    @State private var smsCompose: SMSCompose?
 
     private let elevenLabs = ElevenLabsClient(apiKey: Config.elevenLabsAPIKey, voiceId: Config.elevenLabsVoiceId)
     private let backboard  = BackboardClient(apiKey: Config.backboardAPIKey)
@@ -97,6 +97,10 @@ struct ContentView: View {
         .onChange(of: settings.locationSharingEnabled) { syncLocationSharing() }
         .onChange(of: settings.userRole) { syncLocationSharing() }
         .onChange(of: auth.isAuthenticated) { syncLocationSharing() }
+        // The whole UI is designed on navy cards — without forcing dark
+        // appearance, a phone in light mode renders typed text black-on-navy
+        // (effectively invisible in the contact form fields).
+        .preferredColorScheme(.dark)
     }
 
     private var mainTabs: some View {
@@ -171,11 +175,9 @@ struct ContentView: View {
             connectToBackend()
             syncLocationSharing()
         }
-        .overlay {
-            if let countdown = sosCountdown {
-                SOSCountdownOverlay(countdown: countdown, onCancel: cancelSOS)
-                    .ignoresSafeArea()
-            }
+        .sheet(item: $smsCompose) { compose in
+            SMSComposeView(compose: compose) { smsCompose = nil }
+                .ignoresSafeArea()
         }
         .alert(
             "SOS Alert Failed",
@@ -270,9 +272,10 @@ struct ContentView: View {
         let desc = hazard.spokenDescription
 
         if hazard.urgency == "high" {
-            // TTS and SOS fire in parallel — UI countdown runs concurrently with audio
+            // TTS and SOS fire in parallel — no countdown; the alert goes
+            // out immediately while the narration plays.
             phoneSession.sendSOSAlert()
-            startSOSSequence()
+            autoFireSOS()
             Task { await speakAndPlay(desc) }
         } else {
             Task { await speakAndPlay(desc) }
@@ -302,66 +305,104 @@ struct ContentView: View {
 
     /// Manual SOS from the hold-button: the 3-second hold ring *is* the
     /// confirmation, so this fires immediately with no extra countdown.
-    /// (Hazard-triggered SOS keeps the countdown via startSOSSequence,
-    /// because there the user never made a deliberate gesture to cancel.)
     private func fireManualSOS() {
-        guard sosCountdown == nil else { return }
         Task { await fireSOS() }
     }
 
-    private func startSOSSequence() {
-        guard sosCountdown == nil else { return }
-        sosCountdown = 5
-        sosTask = Task {
-            for remaining in stride(from: 4, through: 0, by: -1) {
-                try? await Task.sleep(for: .seconds(1))
-                guard !Task.isCancelled else { return }
-                await MainActor.run { withAnimation { sosCountdown = remaining } }
-            }
-            await MainActor.run { sosCountdown = nil }
-            guard !Task.isCancelled else { return }
-            await fireSOS()
-        }
-    }
-
-    private func cancelSOS() {
-        sosTask?.cancel()
-        sosTask = nil
-        sosCountdown = nil
-        phoneSession.sendSOSClear()
-        sosManager.stopLiveUpdates()
+    /// Hazard-triggered SOS: also fires immediately (no countdown), but at
+    /// most once every 2 minutes so a burst of high-urgency detections
+    /// can't spam the emergency contacts with repeated alerts.
+    private func autoFireSOS() {
+        if let last = lastSOSAt, Date().timeIntervalSince(last) < 120 { return }
+        Task { await fireSOS() }
     }
 
     private func fireSOS() async {
+        lastSOSAt = Date()
         do {
             let location = try await sosManager.requestLocation()
 
             // Attach this location snapshot to History: either the hazard
             // incident that triggered this SOS, or (for a manually-held SOS
             // button with no preceding hazard) a fresh "manual SOS" entry.
+            let isAutoTriggered = pendingSOSIncidentId != nil
             let incidentId = pendingSOSIncidentId ?? incidents.log(
                 hazardType: "manual_sos", direction: "-", urgency: "high"
             )
             incidents.attachLocation(location, toIncidentWithId: incidentId)
             pendingSOSIncidentId = nil
 
-            try await sosManager.sendEmergencyAlert(
-                to: contactsManager.contacts,
+            let contacts = contactsManager.contacts
+            guard !contacts.isEmpty else {
+                sosErrorMessage = "No emergency contacts are saved. Add at least one, with their carrier, in the Safety tab."
+                return
+            }
+
+            // Zero-touch real SMS/iMessage: the Mac running the pipeline
+            // server relays the message through Messages.app (scriptable on
+            // macOS — unlike iOS, which forbids silent sending). If the Mac
+            // relay can't reach every contact, fall back to the pre-filled
+            // system Messages sheet: one tap on Send delivers from the
+            // user's own number.
+            let link = "https://maps.apple.com/?ll=\(location.coordinate.latitude),\(location.coordinate.longitude)"
+            let messageBody = "CaneOS SOS — I need help. My location: \(link)"
+            let numbers = contacts.map(\.phoneNumber)
+            let relayedToAll = await sendViaMacRelay(recipients: numbers, message: messageBody)
+            if !relayedToAll, SMSComposeView.canSend {
+                smsCompose = SMSCompose(recipients: numbers, body: messageBody)
+            }
+
+            // Real delivery: server-side Resend → carrier-SMS-gateway send
+            // via the Vercel /api/sos endpoint. Throws with the server's
+            // per-recipient failure detail if nothing could be sent.
+            try await BackendClient.shared.sendSOS(
+                contactGatewayAddresses: contacts.map(\.smsGatewayAddress),
+                location: location,
+                hazardType: isAutoTriggered ? (lastHazard?.hazardType ?? "hazard") : "manual_sos",
+                direction: isAutoTriggered ? (lastHazard?.direction.rawValue ?? "-") : "-",
+                urgency: "high"
+            )
+
+            // Best-effort: SOS event document in Atlas, plus a live location
+            // trail patched onto it every ~90s while the SOS stays active.
+            try? await sosManager.sendEmergencyAlert(
+                to: contacts,
                 location: location,
                 backendURL: Config.atlasDataAPIURL,
                 backendAPIKey: Config.atlasAPIKey
             )
-
-            // Keep contacts updated with a fresh location text every
-            // ~90s for as long as the SOS stays active, instead of one
-            // static pin from the moment it fired.
             sosManager.startLiveUpdates(
-                to: contactsManager.contacts,
+                to: contacts,
                 backendURL: Config.atlasDataAPIURL,
                 backendAPIKey: Config.atlasAPIKey
             )
         } catch {
             sosErrorMessage = error.localizedDescription
+        }
+    }
+
+    /// Asks the Mac (pipeline server) to send the SOS text through
+    /// Messages.app — fully automatic, no taps. Returns true only if every
+    /// recipient was sent, so callers can fall back to the compose sheet
+    /// for anything less.
+    private func sendViaMacRelay(recipients: [String], message: String) async -> Bool {
+        guard !recipients.isEmpty,
+              let url = URL(string: "\(Config.pipelineBaseURL)/sos") else { return false }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = 10
+        request.httpBody = try? JSONSerialization.data(withJSONObject: [
+            "recipients": recipients, "message": message
+        ])
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard (response as? HTTPURLResponse)?.statusCode == 200,
+                  let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let sent = json["sent"] as? Int else { return false }
+            return sent >= recipients.count
+        } catch {
+            return false
         }
     }
 
@@ -1048,6 +1089,7 @@ struct SafetyView: View {
             // Add-contact form — blue header makes it clearly the input area
             Section {
                 TextField("Name", text: $newName)
+                    .foregroundColor(.white)
                     .listRowBackground(Color.caneCard)
 
                 Picker("Country", selection: $selectedCountry) {
@@ -1065,6 +1107,7 @@ struct SafetyView: View {
                         Text(selectedCountry.dialCode)
                             .foregroundColor(Color(white: 0.55))
                         TextField("Phone number", text: $newPhone)
+                            .foregroundColor(.white)
                             .keyboardType(.phonePad)
                             .onChange(of: newPhone) { _, newValue in
                                 let digits = newValue.filter { $0.isNumber }
@@ -1420,6 +1463,7 @@ private struct EditContactSheet: View {
             List {
                 Section {
                     TextField("Name", text: $name)
+                        .foregroundColor(.white)
                         .listRowBackground(Color.caneCard)
                 } header: { Text("Name").foregroundColor(Color(white: 0.55)) }
 
@@ -1438,6 +1482,7 @@ private struct EditContactSheet: View {
                             Text(selectedCountry.dialCode)
                                 .foregroundColor(Color(white: 0.55))
                             TextField("Phone number", text: $phone)
+                                .foregroundColor(.white)
                                 .keyboardType(.phonePad)
                                 .onChange(of: phone) { _, newValue in
                                     let digits = newValue.filter { $0.isNumber }
@@ -1581,61 +1626,6 @@ private struct EditContactSheet: View {
             bumpExistingPrimaryToSecondary: bump
         )
         onDismiss()
-    }
-}
-
-// MARK: - SOS countdown overlay
-
-struct SOSCountdownOverlay: View {
-    let countdown: Int
-    let onCancel: () -> Void
-    @State private var pulse = false
-
-    var body: some View {
-        GeometryReader { geo in
-            ZStack {
-                Color.black.opacity(0.90).ignoresSafeArea()
-
-                VStack(spacing: 0) {
-                    // Top ~68% — alert content
-                    VStack(spacing: 16) {
-                        Spacer()
-                        Image(systemName: "exclamationmark.triangle.fill")
-                            .font(.system(size: 52))
-                            .foregroundColor(.caneRed)
-                            .scaleEffect(pulse ? 1.08 : 1.0)
-                            .animation(
-                                .easeInOut(duration: 0.5).repeatForever(autoreverses: true),
-                                value: pulse)
-                        Text("SOS sending in")
-                            .font(.title2.bold())
-                            .foregroundColor(.white)
-                        Text("\(countdown)")
-                            .font(.system(size: 88, weight: .black))
-                            .foregroundColor(.caneRed)
-                            .monospacedDigit()
-                            .contentTransition(.numericText(countsDown: true))
-                            .animation(.default, value: countdown)
-                        Spacer()
-                    }
-                    .frame(height: geo.size.height * 0.68)
-
-                    // Bottom 32% — cancel (exceeds the 30% spec requirement)
-                    Button(action: onCancel) {
-                        Text("CANCEL SOS")
-                            .font(.system(size: 22, weight: .black))
-                            .foregroundColor(.white)
-                            .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    }
-                    .background(Color.caneRed)
-                    .frame(height: geo.size.height * 0.32)
-                    .accessibilityLabel("Cancel emergency SOS")
-                    .accessibilityHint("Double tap to cancel the emergency alert before it sends")
-                }
-            }
-        }
-        .ignoresSafeArea()
-        .onAppear { pulse = true }
     }
 }
 
