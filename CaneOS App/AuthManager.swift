@@ -4,6 +4,11 @@ import Auth0
 
 /// Manages the Auth0 login session and triggers MongoDB Atlas cloud sync.
 ///
+/// Beyond login, the Auth0 session is the app's API credential: every request
+/// AtlasClient makes to the backend carries the Auth0-issued ID token, which
+/// the backend verifies against the tenant's JWKS and uses to scope all
+/// MongoDB reads/writes to this user server-side.
+///
 /// ── Setup checklist ──────────────────────────────────────────────────────
 ///
 /// 1. Add Auth0.swift via Swift Package Manager:
@@ -19,18 +24,17 @@ import Auth0
 /// 4. In the Auth0 dashboard add these Allowed Callback / Logout URLs:
 ///    {BUNDLE_ID}://{YOUR_DOMAIN}/ios/{BUNDLE_ID}/callback
 ///    (replace BUNDLE_ID and YOUR_DOMAIN with your actual values)
-///
-/// 5. Fill in the three Atlas keys in Config.swift.
 /// ─────────────────────────────────────────────────────────────────────────
 @MainActor
 final class AuthManager: ObservableObject {
     static let shared = AuthManager()
 
     @Published var isAuthenticated = false
-    @Published var userId:    String?
-    @Published var userName:  String?
-    @Published var userEmail: String?
-    @Published var isSyncing  = false
+    @Published var userId:     String?
+    @Published var userName:   String?
+    @Published var userEmail:  String?
+    @Published var userPicture: URL?
+    @Published var isSyncing   = false
 
     private let credManager = CredentialsManager(authentication: Auth0.authentication())
 
@@ -42,7 +46,12 @@ final class AuthManager: ObservableObject {
 
     func login() async {
         do {
-            let creds = try await Auth0.webAuth().start()
+            // offline_access asks Auth0 for a refresh token so the
+            // CredentialsManager can silently renew the session (and the
+            // ID token AtlasClient sends to the backend) when it expires.
+            let creds = try await Auth0.webAuth()
+                .scope("openid profile email offline_access")
+                .start()
             try credManager.store(credentials: creds)
             let profile = try await Auth0.authentication()
                 .userInfo(withAccessToken: creds.accessToken)
@@ -62,7 +71,15 @@ final class AuthManager: ObservableObject {
         }
         try? credManager.clear()
         isAuthenticated = false
-        userId = nil; userName = nil; userEmail = nil
+        userId = nil; userName = nil; userEmail = nil; userPicture = nil
+    }
+
+    /// A fresh Auth0 ID token for authenticating backend requests.
+    /// CredentialsManager transparently renews expired credentials using the
+    /// stored refresh token. Returns nil when signed out.
+    func bearerToken() async -> String? {
+        guard isAuthenticated else { return nil }
+        return try? await credManager.credentials().idToken
     }
 
     // MARK: - Cloud sync
@@ -89,9 +106,10 @@ final class AuthManager: ObservableObject {
 
     private func applyProfile(_ profile: UserProfile) {
         isAuthenticated = true
-        userId    = profile.sub
-        userName  = profile.name ?? profile.givenName
-        userEmail = profile.email
+        userId      = profile.sub
+        userName    = profile.name ?? profile.givenName
+        userEmail   = profile.email
+        userPicture = profile.picture
     }
 
     private func restoreSession() async {

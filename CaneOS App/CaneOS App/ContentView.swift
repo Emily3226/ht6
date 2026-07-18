@@ -190,6 +190,7 @@ struct ContentView: View {
             Task {
                 if let location = try? await sosManager.requestLocation() {
                     incidents.attachLocation(location, toIncidentWithId: incidentId)
+                    await announceRepeatHazardIfAny(hazard, at: location, incidentId: incidentId)
                 }
             }
         }
@@ -205,6 +206,27 @@ struct ContentView: View {
         } else {
             Task { await speakAndPlay(desc) }
         }
+    }
+
+    /// Checks Atlas ($geoNear on the incident log) for past incidents of the
+    /// same hazard type within ~40 m and, if any exist, speaks a "you've
+    /// encountered this here before" callback after the main narration.
+    private func announceRepeatHazardIfAny(_ hazard: HazardMessage,
+                                           at location: CLLocation,
+                                           incidentId: UUID) async {
+        guard settings.audioEnabled,
+              let uid = AuthManager.shared.userId else { return }
+        let repeats = await incidents.nearbyRepeatCount(
+            hazardType: hazard.hazardType,
+            latitude: location.coordinate.latitude,
+            longitude: location.coordinate.longitude,
+            excluding: incidentId,
+            userId: uid
+        )
+        guard repeats > 0 else { return }
+        let hazardName = hazard.hazardType.replacingOccurrences(of: "_", with: " ")
+        let times = repeats == 1 ? "once" : "\(repeats) times"
+        await speakAndPlay("Heads up — you've encountered a \(hazardName) at this spot \(times) before.")
     }
 
     private func startSOSSequence() {
@@ -486,16 +508,31 @@ struct SettingsView: View {
                 // MARK: Account (Auth0 + Atlas sync)
                 Section {
                     if auth.isAuthenticated {
-                        VStack(alignment: .leading, spacing: 5) {
-                            if let name = auth.userName {
-                                Text(name)
-                                    .font(.body.weight(.semibold))
-                                    .foregroundColor(.white)
+                        HStack(spacing: 12) {
+                            if let picture = auth.userPicture {
+                                AsyncImage(url: picture) { image in
+                                    image.resizable()
+                                } placeholder: {
+                                    Circle().fill(Color(white: 0.20))
+                                }
+                                .frame(width: 44, height: 44)
+                                .clipShape(Circle())
+                                .overlay(Circle().stroke(Color.caneBlue.opacity(0.6), lineWidth: 1.5))
                             }
-                            if let email = auth.userEmail {
-                                Text(email)
-                                    .font(.caption)
-                                    .foregroundColor(Color(white: 0.55))
+                            VStack(alignment: .leading, spacing: 5) {
+                                if let name = auth.userName {
+                                    Text(name)
+                                        .font(.body.weight(.semibold))
+                                        .foregroundColor(.white)
+                                }
+                                if let email = auth.userEmail {
+                                    Text(email)
+                                        .font(.caption)
+                                        .foregroundColor(Color(white: 0.55))
+                                }
+                                Text("Requests verified by Auth0 · data in MongoDB Atlas")
+                                    .font(.system(size: 10))
+                                    .foregroundColor(Color(white: 0.40))
                             }
                         }
                         .padding(.vertical, 2)
@@ -1328,7 +1365,9 @@ struct SOSCountdownOverlay: View {
 
 struct HistoryView: View {
     @ObservedObject var store: IncidentStore
+    @ObservedObject private var auth = AuthManager.shared
     @Environment(\.openURL) private var openURL
+    @State private var insights: IncidentStore.Insights?
 
     private static let formatter: DateFormatter = {
         let f = DateFormatter()
@@ -1351,14 +1390,28 @@ struct HistoryView: View {
                 }
             } else {
                 List {
-                    ForEach(store.incidents) { incident in
-                        incidentRow(incident)
+                    if let insights, insights.total > 0 {
+                        Section {
+                            insightsCard(insights)
+                                .listRowBackground(Color.caneNavy)
+                                .listRowInsets(EdgeInsets())
+                        }
                     }
-                    .onDelete(perform: store.remove)
+                    Section {
+                        ForEach(store.incidents) { incident in
+                            incidentRow(incident)
+                        }
+                        .onDelete(perform: store.remove)
+                    }
                 }
                 .listStyle(.plain)
                 .scrollContentBackground(.hidden)
             }
+        }
+        // Re-run the Atlas aggregation whenever the log changes or the user
+        // signs in/out.
+        .task(id: "\(store.incidents.count)-\(auth.userId ?? "-")") {
+            await loadInsights()
         }
         .toolbar {
             ToolbarItem(placement: .navigationBarTrailing) {
@@ -1369,6 +1422,69 @@ struct HistoryView: View {
                 }
             }
         }
+    }
+
+    private func loadInsights() async {
+        guard let uid = auth.userId else {
+            insights = nil
+            return
+        }
+        insights = await store.fetchInsights(userId: uid)
+    }
+
+    private func insightsCard(_ insights: IncidentStore.Insights) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 6) {
+                Image(systemName: "chart.bar.fill")
+                    .foregroundColor(.caneBlue)
+                Text("INSIGHTS")
+                    .font(.caption.bold())
+                    .foregroundColor(.caneBlue)
+                Spacer()
+                Text("Live from Atlas")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundColor(Color(white: 0.45))
+            }
+
+            HStack(spacing: 10) {
+                statTile(value: insights.total, label: "Total", color: .caneBlue)
+                statTile(value: insights.highCount, label: "High", color: .red)
+                statTile(value: insights.mediumCount, label: "Medium", color: .orange)
+                statTile(value: insights.lowCount, label: "Low", color: Color(white: 0.55))
+            }
+
+            if let top = insights.topHazards.first {
+                HStack(spacing: 6) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.caption)
+                        .foregroundColor(.yellow)
+                    Text("Most common: \(top.type.replacingOccurrences(of: "_", with: " ").capitalized) (\(top.count)×)")
+                        .font(.caption)
+                        .foregroundColor(Color(white: 0.70))
+                }
+            }
+        }
+        .padding(16)
+        .background(Color.caneCard)
+        .cornerRadius(16)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Incident insights: \(insights.total) total, \(insights.highCount) high urgency, \(insights.mediumCount) medium, \(insights.lowCount) low")
+    }
+
+    private func statTile(value: Int, label: String, color: Color) -> some View {
+        VStack(spacing: 3) {
+            Text("\(value)")
+                .font(.title3.bold())
+                .monospacedDigit()
+                .foregroundColor(color)
+            Text(label)
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundColor(Color(white: 0.50))
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 8)
+        .background(Color.caneNavy.opacity(0.6))
+        .cornerRadius(10)
     }
 
     private func incidentRow(_ incident: Incident) -> some View {

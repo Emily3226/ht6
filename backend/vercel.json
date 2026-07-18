@@ -1,10 +1,5 @@
 {
-  "version": 2,
-  "framework": null,
-  "builds": [
-    { "src": "api/db.js", "use": "@vercel/node" }
-  ],
-  "routes": [
-    { "src": "/action/(.*)", "dest": "/api/db?action=$1" }
+  "rewrites": [
+    { "source": "/action/:action", "destination": "/api/db?action=:action" }
   ]
 }
