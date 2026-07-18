@@ -52,16 +52,10 @@ struct ContentView: View {
     @StateObject private var contactsManager = EmergencyContactsManager.shared
     @StateObject private var settings        = AppSettings.shared
     @StateObject private var incidents       = IncidentStore.shared
-    @StateObject private var auth            = AuthManager.shared
 
-    // Two independent sockets, matching the backend's split:
-    // /ws/haptics -- immediate, unthrottled, 3-value direction only.
-    // /ws/hazards -- richer, throttled by the backend, drives audio/UI.
-    @State private var hapticsConnection   = CaneSocketConnection<HapticMessage>()
-    @State private var hazardsConnection   = CaneSocketConnection<CaneHazardChannelEvent>()
-    @State private var statusConnection    = CaneSocketConnection<StatusMessage>()
+    @State private var caneConnection      = CaneConnection()
     @State private var sosManager          = SOSManager()
-    @State private var lastHazard: HazardMessage?
+    @State private var lastHazard: CaneMessage?
     @State private var isScanning          = false
     @State private var isHardwareConnected = false
     @State private var sosCountdown: Int?  = nil
@@ -70,7 +64,6 @@ struct ContentView: View {
     @State private var pendingSOSIncidentId: UUID?
 
     private let elevenLabs = ElevenLabsClient(apiKey: Config.elevenLabsAPIKey, voiceId: Config.elevenLabsVoiceId)
-    private let backboard  = BackboardClient(apiKey: Config.backboardAPIKey)
 
     var body: some View {
         TabView {
@@ -101,7 +94,7 @@ struct ContentView: View {
             .tabItem { Label("Home", systemImage: "house.fill") }
 
             NavigationStack {
-                SettingsView(settings: settings, auth: auth)
+                SettingsView(settings: settings)
                     .navigationTitle("Settings")
             }
             .tabItem { Label("Settings", systemImage: "slider.horizontal.3") }
@@ -143,57 +136,34 @@ struct ContentView: View {
     // MARK: - Backend wiring
 
     private func connectToBackend() {
-        // /ws/haptics: immediate, unthrottled. The handler does exactly one
-        // thing -- forward the buzz -- with nothing else on the path (no
-        // logging, no async work, no awaiting) so nothing here adds latency
-        // between the sensor firing on the backend and the Watch buzzing.
-        hapticsConnection.onMessage = { message in
-            phoneSession.sendHaptic(message.direction)
-        }
-        hapticsConnection.connect(to: Config.hapticsWebSocketURL)
-
-        // /ws/hazards: richer, backend-throttled. Drives the UI, TTS, SOS,
-        // and incident history.
-        hazardsConnection.onConnectionChange = { connected in
+        caneConnection.onConnectionChange = { connected in
             isHardwareConnected = connected
         }
-        hazardsConnection.onMessage = { event in
+        caneConnection.onMessage = { message in
             Task { @MainActor in
-                switch event {
-                case .hazard(let hazard):
-                    handleHazard(hazard)
-                case .sceneDescription(let text):
-                    await handleSceneDescription(text)
+                switch message.type {
+                case "hazard":            handleHazard(message)
+                case "scene_description": await handleSceneDescription(message)
+                default: break
                 }
             }
         }
-        hazardsConnection.connect(to: Config.hazardsWebSocketURL)
-
-        // /ws/status: rare, unthrottled system-health transitions. Only two
-        // possible events, so a plain switch is enough -- no throttling
-        // needed since the backend itself only fires this on an actual
-        // state change, not on a polling cadence.
-        statusConnection.onMessage = { message in
-            Task { @MainActor in
-                switch message.event {
-                case .cameraOffline:
-                    await speakAndPlay("Heads up — the camera has gone offline. Obstacle detection is temporarily unavailable.")
-                case .cameraRestored:
-                    await speakAndPlay("The camera is back online. Obstacle detection has resumed.")
-                }
-            }
-        }
-        statusConnection.connect(to: Config.statusWebSocketURL)
+        caneConnection.connect(to: Config.backendWebSocketURL)
     }
 
-    private func handleHazard(_ hazard: HazardMessage) {
+    private func handleHazard(_ hazard: CaneMessage) {
         lastHazard = hazard
         isScanning = false
         let incidentId = incidents.log(
-            hazardType: hazard.hazardType,
-            direction:  hazard.direction.rawValue,
-            urgency:    hazard.urgency
+            hazardType: hazard.hazardType ?? "unknown",
+            direction:  hazard.direction  ?? "-",
+            urgency:    hazard.urgency    ?? "-"
         )
+
+        if let dir = hazard.direction,
+           let hDir = PhoneSessionManager.HapticDirection(rawValue: dir) {
+            phoneSession.sendHaptic(hDir)
+        }
 
         if hazard.urgency == "high" {
             // High-urgency hazards trigger the SOS flow, which fetches location
@@ -211,8 +181,7 @@ struct ContentView: View {
             }
         }
 
-        guard settings.audioEnabled else { return }
-        let desc = hazard.spokenDescription
+        guard settings.audioEnabled, let desc = hazard.spokenDescription else { return }
 
         if hazard.urgency == "high" {
             // TTS and SOS fire in parallel — UI countdown runs concurrently with audio
@@ -244,7 +213,6 @@ struct ContentView: View {
         sosTask = nil
         sosCountdown = nil
         phoneSession.sendSOSClear()
-        sosManager.stopLiveUpdates()
     }
 
     private func fireSOS() async {
@@ -263,17 +231,8 @@ struct ContentView: View {
             try await sosManager.sendEmergencyAlert(
                 to: contactsManager.contacts,
                 location: location,
-                backendURL: Config.atlasDataAPIURL,
-                backendAPIKey: Config.atlasAPIKey
-            )
-
-            // Keep contacts updated with a fresh location text every
-            // ~90s for as long as the SOS stays active, instead of one
-            // static pin from the moment it fired.
-            sosManager.startLiveUpdates(
-                to: contactsManager.contacts,
-                backendURL: Config.atlasDataAPIURL,
-                backendAPIKey: Config.atlasAPIKey
+                resendAPIKey: Config.resendAPIKey,
+                fromEmail: Config.resendFromEmail
             )
         } catch {
             sosErrorMessage = error.localizedDescription
@@ -282,17 +241,13 @@ struct ContentView: View {
 
     private func requestSceneDescription() {
         isScanning = true
-        hazardsConnection.sendCommand("scan_now")
+        caneConnection.sendCommand("scan_now")
     }
 
-    private func handleSceneDescription(_ text: String) async {
+    private func handleSceneDescription(_ message: CaneMessage) async {
         isScanning = false
-        do {
-            let reply = try await backboard.send(text: text)
-            await speakAndPlay(reply)
-        } catch {
-            await speakAndPlay(text)
-        }
+        guard let text = message.text else { return }
+        await speakAndPlay(text)
     }
 
     private func speakAndPlay(_ text: String) async {
@@ -310,7 +265,7 @@ struct ContentView: View {
 struct HomeView: View {
     let isConnected: Bool
     let isWatchConnected: Bool
-    let lastHazard: HazardMessage?
+    let lastHazard: CaneMessage?
     let isScanning: Bool
     let onScan: () -> Void
     let onRefresh: () async -> Void
@@ -391,7 +346,7 @@ struct HomeView: View {
             : "Apple Watch not reachable")
     }
 
-    private func lastAlertCard(_ hazard: HazardMessage) -> some View {
+    private func lastAlertCard(_ hazard: CaneMessage) -> some View {
         HStack(spacing: 14) {
             Image(systemName: "exclamationmark.triangle.fill")
                 .foregroundColor(.yellow)
@@ -401,10 +356,10 @@ struct HomeView: View {
                     .font(.caption)
                     .foregroundColor(Color(white: 0.50))
                     .textCase(.uppercase)
-                Text(hazard.hazardType.capitalized)
+                Text(hazard.hazardType?.capitalized ?? "Hazard")
                     .font(.headline)
                     .foregroundColor(.white)
-                Text("\(hazard.direction.rawValue) · \(hazard.urgency) urgency")
+                Text("\(hazard.direction ?? "-") · \(hazard.urgency ?? "-") urgency")
                     .font(.subheadline)
                     .foregroundColor(Color(white: 0.60))
             }
@@ -414,7 +369,7 @@ struct HomeView: View {
         .background(Color.caneCard)
         .cornerRadius(16)
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("Last alert: \(hazard.hazardType), \(hazard.direction.rawValue), \(hazard.urgency) urgency")
+        .accessibilityLabel("Last alert: \(hazard.hazardType ?? "hazard"), \(hazard.direction ?? "unknown direction"), \(hazard.urgency ?? "unknown") urgency")
     }
 
     private var scanButton: some View {
@@ -443,7 +398,6 @@ struct HomeView: View {
 
 struct SettingsView: View {
     @ObservedObject var settings: AppSettings
-    @ObservedObject var auth: AuthManager
 
     var body: some View {
         ZStack {
@@ -498,80 +452,6 @@ struct SettingsView: View {
                     .accessibilityHint("Toggles spoken descriptions for detected obstacles")
                 } header: {
                     sectionHeader(icon: "speaker.wave.2.fill", title: "Audio")
-                }
-
-                // MARK: Account (Auth0 + Atlas sync)
-                Section {
-                    if auth.isAuthenticated {
-                        VStack(alignment: .leading, spacing: 5) {
-                            if let name = auth.userName {
-                                Text(name)
-                                    .font(.body.weight(.semibold))
-                                    .foregroundColor(.white)
-                            }
-                            if let email = auth.userEmail {
-                                Text(email)
-                                    .font(.caption)
-                                    .foregroundColor(Color(white: 0.55))
-                            }
-                        }
-                        .padding(.vertical, 2)
-                        .listRowBackground(Color.caneCard)
-
-                        Button {
-                            Task { await auth.syncToCloud() }
-                        } label: {
-                            HStack(spacing: 8) {
-                                if auth.isSyncing {
-                                    ProgressView().tint(.caneBlue)
-                                } else {
-                                    Image(systemName: "arrow.triangle.2.circlepath")
-                                        .foregroundColor(.caneBlue)
-                                }
-                                Text(auth.isSyncing ? "Syncing…" : "Sync now")
-                                    .foregroundColor(.white)
-                            }
-                        }
-                        .disabled(auth.isSyncing)
-                        .listRowBackground(Color.caneCard)
-                        .accessibilityLabel("Sync contacts and settings to cloud")
-
-                        Button(role: .destructive) {
-                            Task { await auth.logout() }
-                        } label: {
-                            Text("Sign Out")
-                                .frame(maxWidth: .infinity, alignment: .center)
-                                .font(.body.weight(.semibold))
-                        }
-                        .listRowBackground(Color.caneCard)
-                    } else {
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text("Sign in to sync your contacts and settings across devices.")
-                                .font(.caption)
-                                .foregroundColor(Color(white: 0.55))
-                        }
-                        .listRowBackground(Color.caneCard)
-
-                        Button {
-                            Task { await auth.login() }
-                        } label: {
-                            HStack {
-                                Spacer()
-                                if auth.isSyncing {
-                                    ProgressView().tint(.white)
-                                }
-                                Text(auth.isSyncing ? "Signing in…" : "Sign in with Auth0")
-                                    .font(.body.weight(.semibold))
-                                    .foregroundColor(.white)
-                                Spacer()
-                            }
-                        }
-                        .disabled(auth.isSyncing)
-                        .listRowBackground(auth.isSyncing ? Color(white: 0.18) : Color.caneBlue)
-                        .accessibilityLabel("Sign in with Auth0")
-                    }
-                } header: {
-                    sectionHeader(icon: "person.crop.circle.fill", title: "Account")
                 }
             }
             .listStyle(.plain)
