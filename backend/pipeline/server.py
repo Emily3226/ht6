@@ -191,6 +191,55 @@ async def broadcast_status(event: str, timestamp: float) -> None:
     await status_manager.broadcast({"event": event, "timestamp": timestamp})
 
 
+# ---------------------------------------------------------------------------
+# Demo/testing hook: lets the phone app fake a sensor event on demand.
+# Forces a dip on the chosen mock ToF sensor, so the REAL haptic loop /
+# thresholds / arbiter / narration pipeline all react exactly as they would
+# to hardware -- nothing downstream is stubbed. For left/right (which the
+# overhead-narration path doesn't cover), a matching fake camera detection
+# is also queued so the event gets a plain-English Gemini narration too.
+# ---------------------------------------------------------------------------
+
+import random as _random
+
+from fastapi import HTTPException
+
+from pipeline import narration_queue as _narration_queue
+from pipeline import tof_input as _tof_input
+from pipeline.detection_input import capture_frame as _capture_frame
+
+_SIM_DISTANCE_M = 0.5
+_SIM_OBJECT_CLASSES = ("pole", "person", "bicycle", "chair")
+
+
+@app.post("/simulate/tof/{direction}")
+async def simulate_tof(direction: str) -> dict:
+    if direction not in ("left", "right", "up"):
+        raise HTTPException(status_code=400, detail="direction must be left, right, or up")
+
+    _tof_input.force_dip(direction, distance_m=_SIM_DISTANCE_M)
+
+    object_class = None
+    if direction in ("left", "right"):
+        # Random object class per tap so repeated simulations read as new
+        # hazards to HazardThrottle's (object_class, direction) dedup and
+        # still narrate instead of being cooldown-suppressed.
+        object_class = _random.choice(_SIM_OBJECT_CLASSES)
+        detection = {
+            "timestamp": time.time(),
+            "object_class": object_class,
+            "direction": direction,
+            "confidence": 0.95,
+            "distance_m": _SIM_DISTANCE_M,
+        }
+        _narration_queue.push_nowait(
+            {"source": "camera", "detection": detection, "frame": _capture_frame()}
+        )
+
+    logger.info("Simulated ToF event: direction=%s object_class=%s", direction, object_class)
+    return {"ok": True, "direction": direction, "object_class": object_class}
+
+
 def get_local_ip() -> str:
     """
     Best-effort discovery of this machine's LAN IP (not 127.0.0.1), since
