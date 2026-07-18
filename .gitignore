@@ -30,4 +30,6 @@ DerivedData/
 
 .DS_Store
 
+node_modules/
+
 CaneOS App/CaneOS App/Config.swift
