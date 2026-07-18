@@ -1,4 +1,7 @@
 import SwiftUI
+import MapKit
+import CoreLocation
+import UIKit
 
 // MARK: - Color palette
 
@@ -57,6 +60,8 @@ struct ContentView: View {
     @State private var isHardwareConnected = false
     @State private var sosCountdown: Int?  = nil
     @State private var sosTask: Task<Void, Never>?
+    @State private var sosErrorMessage: String?
+    @State private var pendingSOSIncidentId: UUID?
 
     private let elevenLabs = ElevenLabsClient(apiKey: Config.elevenLabsAPIKey, voiceId: Config.elevenLabsVoiceId)
     private let backboard  = BackboardClient(apiKey: Config.backboardAPIKey)
@@ -115,6 +120,18 @@ struct ContentView: View {
                     .ignoresSafeArea()
             }
         }
+        .alert(
+            "SOS Alert Failed",
+            isPresented: Binding(
+                get: { sosErrorMessage != nil },
+                set: { if !$0 { sosErrorMessage = nil } }
+            ),
+            presenting: sosErrorMessage
+        ) { _ in
+            Button("OK", role: .cancel) { sosErrorMessage = nil }
+        } message: { message in
+            Text(message)
+        }
     }
 
     // MARK: - Backend wiring
@@ -138,7 +155,7 @@ struct ContentView: View {
     private func handleHazard(_ hazard: CaneMessage) {
         lastHazard = hazard
         isScanning = false
-        incidents.log(
+        let incidentId = incidents.log(
             hazardType: hazard.hazardType ?? "unknown",
             direction:  hazard.direction  ?? "-",
             urgency:    hazard.urgency    ?? "-"
@@ -147,6 +164,22 @@ struct ContentView: View {
         if let dir = hazard.direction,
            let hDir = PhoneSessionManager.HapticDirection(rawValue: dir) {
             phoneSession.sendHaptic(hDir)
+        }
+
+        if hazard.urgency == "high" {
+            // High-urgency hazards trigger the SOS flow, which fetches location
+            // anyway to send with the alert -- reuse that fetch for the incident's
+            // location snapshot instead of requesting location twice.
+            pendingSOSIncidentId = incidentId
+        } else {
+            // Best-effort geolocation snapshot for the History entry. Failures
+            // here (permission denied, no fix yet) are expected and non-fatal,
+            // so we stay silent rather than alerting for every logged incident.
+            Task {
+                if let location = try? await sosManager.requestLocation() {
+                    incidents.attachLocation(location, toIncidentWithId: incidentId)
+                }
+            }
         }
 
         guard settings.audioEnabled, let desc = hazard.spokenDescription else { return }
@@ -186,6 +219,16 @@ struct ContentView: View {
     private func fireSOS() async {
         do {
             let location = try await sosManager.requestLocation()
+
+            // Attach this location snapshot to History: either the hazard
+            // incident that triggered this SOS, or (for a manually-held SOS
+            // button with no preceding hazard) a fresh "manual SOS" entry.
+            let incidentId = pendingSOSIncidentId ?? incidents.log(
+                hazardType: "manual_sos", direction: "-", urgency: "high"
+            )
+            incidents.attachLocation(location, toIncidentWithId: incidentId)
+            pendingSOSIncidentId = nil
+
             try await sosManager.sendEmergencyAlert(
                 to: contactsManager.contacts,
                 location: location,
@@ -194,7 +237,7 @@ struct ContentView: View {
                 fromNumber: Config.twilioFromNumber
             )
         } catch {
-            print("SOS failed: \(error.localizedDescription)")
+            sosErrorMessage = error.localizedDescription
         }
     }
 
@@ -667,6 +710,7 @@ struct SOSCountdownOverlay: View {
 
 struct HistoryView: View {
     @ObservedObject var store: IncidentStore
+    @Environment(\.openURL) private var openURL
 
     private static let formatter: DateFormatter = {
         let f = DateFormatter()
@@ -710,24 +754,36 @@ struct HistoryView: View {
     }
 
     private func incidentRow(_ incident: Incident) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 8) {
-                urgencyPill(incident.urgency)
-                Text(incident.hazardType.capitalized)
-                    .font(.headline)
-                    .foregroundColor(.white)
+        HStack(alignment: .top, spacing: 12) {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 8) {
+                    urgencyPill(incident.urgency)
+                    Text(incident.hazardType.replacingOccurrences(of: "_", with: " ").capitalized)
+                        .font(.headline)
+                        .foregroundColor(.white)
+                }
+                Text("\(incident.direction.capitalized) direction")
+                    .font(.subheadline)
+                    .foregroundColor(Color(white: 0.55))
+                Text(Self.formatter.string(from: incident.date))
+                    .font(.caption)
+                    .foregroundColor(Color(white: 0.40))
             }
-            Text("\(incident.direction.capitalized) direction")
-                .font(.subheadline)
-                .foregroundColor(Color(white: 0.55))
-            Text(Self.formatter.string(from: incident.date))
-                .font(.caption)
-                .foregroundColor(Color(white: 0.40))
+
+            Spacer(minLength: 0)
+
+            if incident.hasLocation {
+                IncidentLocationSnapshot(incident: incident)
+                    .onTapGesture {
+                        if let url = incident.mapsURL { openURL(url) }
+                    }
+                    .accessibilityLabel("Open incident location in Maps")
+            }
         }
         .padding(.vertical, 6)
         .listRowBackground(Color.caneCard)
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("\(incident.urgency) urgency \(incident.hazardType) from \(incident.direction) at \(Self.formatter.string(from: incident.date))")
+        .accessibilityLabel("\(incident.urgency) urgency \(incident.hazardType) from \(incident.direction) at \(Self.formatter.string(from: incident.date))\(incident.hasLocation ? ", location recorded" : "")")
     }
 
     @ViewBuilder
@@ -747,5 +803,71 @@ struct HistoryView: View {
         case "medium": return .orange
         default:       return .caneBlue
         }
+    }
+}
+
+// MARK: - Incident location snapshot thumbnail
+
+/// A small static map image for a saved incident location. Uses
+/// MKMapSnapshotter (a lightweight rendered image) rather than an
+/// interactive MKMapView/Map, since these appear one-per-row in a list.
+struct IncidentLocationSnapshot: View {
+    let incident: Incident
+    @State private var image: UIImage?
+
+    private let size = CGSize(width: 64, height: 64)
+
+    var body: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 8)
+                .fill(Color(white: 0.14))
+            if let image {
+                Image(uiImage: image)
+                    .resizable()
+                    .aspectRatio(contentMode: .fill)
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+            } else {
+                ProgressView()
+                    .tint(.caneBlue)
+            }
+        }
+        .frame(width: size.width, height: size.height)
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(Color(white: 0.25), lineWidth: 1)
+        )
+        .task(id: "\(incident.latitude ?? 0),\(incident.longitude ?? 0)") {
+            await loadSnapshot()
+        }
+    }
+
+    private func loadSnapshot() async {
+        guard let latitude = incident.latitude, let longitude = incident.longitude else { return }
+        let coordinate = CLLocationCoordinate2D(latitude: latitude, longitude: longitude)
+
+        let options = MKMapSnapshotter.Options()
+        options.region = MKCoordinateRegion(
+            center: coordinate,
+            span: MKCoordinateSpan(latitudeDelta: 0.01, longitudeDelta: 0.01)
+        )
+        options.size = size
+        options.scale = UIScreen.main.scale
+        options.showsBuildings = false
+
+        let snapshotter = MKMapSnapshotter(options: options)
+        guard let snapshot = try? await snapshotter.start() else { return }
+
+        let rendered = UIGraphicsImageRenderer(size: size).image { _ in
+            snapshot.image.draw(at: .zero)
+            let point = snapshot.point(for: coordinate)
+            let dotSize: CGFloat = 10
+            let dotRect = CGRect(
+                x: point.x - dotSize / 2, y: point.y - dotSize / 2,
+                width: dotSize, height: dotSize
+            )
+            UIColor.systemRed.setFill()
+            UIBezierPath(ovalIn: dotRect).fill()
+        }
+        image = rendered
     }
 }

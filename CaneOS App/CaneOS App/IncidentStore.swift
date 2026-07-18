@@ -1,6 +1,7 @@
 import Foundation
 import SwiftUI
 import Combine
+import CoreLocation
 
 struct Incident: Identifiable, Codable {
     let id: UUID
@@ -8,6 +9,19 @@ struct Incident: Identifiable, Codable {
     let hazardType: String
     let direction: String
     let urgency: String
+    /// Geolocation snapshot captured at (or shortly after) the moment the
+    /// incident was logged, so History can show where it happened. Optional
+    /// because location may be unavailable (permission denied, no fix yet)
+    /// and older saved incidents predate this field.
+    var latitude: Double?
+    var longitude: Double?
+
+    var hasLocation: Bool { latitude != nil && longitude != nil }
+
+    var mapsURL: URL? {
+        guard let latitude, let longitude else { return nil }
+        return URL(string: "https://maps.apple.com/?ll=\(latitude),\(longitude)")
+    }
 }
 
 final class IncidentStore: ObservableObject {
@@ -17,12 +31,26 @@ final class IncidentStore: ObservableObject {
 
     private init() { load() }
 
-    func log(hazardType: String, direction: String, urgency: String) {
+    /// Logs a new incident and returns its id so a caller can attach a
+    /// geolocation snapshot to it later once the location fix comes back
+    /// (location lookups are async and shouldn't block logging the event).
+    @discardableResult
+    func log(hazardType: String, direction: String, urgency: String) -> UUID {
         let incident = Incident(
             id: UUID(), date: Date(),
-            hazardType: hazardType, direction: direction, urgency: urgency
+            hazardType: hazardType, direction: direction, urgency: urgency,
+            latitude: nil, longitude: nil
         )
         incidents.insert(incident, at: 0)
+        save()
+        return incident.id
+    }
+
+    /// Attaches a geolocation snapshot to a previously logged incident.
+    func attachLocation(_ location: CLLocation, toIncidentWithId id: UUID) {
+        guard let index = incidents.firstIndex(where: { $0.id == id }) else { return }
+        incidents[index].latitude = location.coordinate.latitude
+        incidents[index].longitude = location.coordinate.longitude
         save()
     }
 
