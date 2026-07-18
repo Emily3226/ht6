@@ -23,42 +23,59 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 
 from pipeline import narration_queue, tof_input
+from pipeline.haptic_arbiter import HapticArbiter
 from pipeline.haptic_trigger import check_thresholds
 from pipeline.server import broadcast_haptic
 
 logger = logging.getLogger(__name__)
 
-# ~15Hz. check_thresholds() is deliberately stateless (fires on every tick
-# a sensor reads close, no debouncing -- see haptic_trigger.py), so a
-# sustained single-direction hazard sends one message per tick for as long
-# as it stays close. At 15Hz that tops out at 15 msgs/sec on that direction
-# -- comfortably under the /ws/haptics safety valve's 20 msgs/sec cap, so
-# the cap stays a true rare-bug guard rather than binding during ordinary
-# sustained proximity. (An earlier 100Hz default was tried and reliably hit
-# the cap during any 1+ second sustained-proximity scenario -- pure
-# arithmetic, not a bug -- so the poll rate was brought down to match the
-# cap instead of loosening the cap's framing.) 15Hz is still far faster
-# than a human can perceive as anything but continuous buzzing, and vastly
-# faster than the narration path's multi-second cooldowns.
+# ~15Hz sensor polling. check_thresholds() has no time-based debouncing --
+# see haptic_trigger.py for its hysteresis (two distance thresholds, not a
+# delay) -- so this rate is chosen purely for low detection latency; it is
+# NOT the broadcast rate. HapticArbiter (below) is what
+# actually paces /ws/haptics down to something the Apple Watch's Taptic
+# Engine can physically play (each buzz runs ~1.5-2s): at most one
+# direction broadcasting at a time, at most once every
+# haptic_arbiter.REMINDER_INTERVAL_SECONDS per direction. Polling fast and
+# broadcasting slow are two deliberately separate concerns -- don't couple
+# them by changing this constant to "fix" perceived haptic pacing;
+# retune REMINDER_INTERVAL_SECONDS in haptic_arbiter.py instead.
 DEFAULT_POLL_INTERVAL_S = 1 / 15
 
 
 async def run_haptic_loop(poll_interval_s: float = DEFAULT_POLL_INTERVAL_S) -> None:
     """
     Runs forever as its own independent asyncio background task: read all
-    ToF sensors, check thresholds, broadcast any triggered directions,
-    sleep briefly, repeat. Never awaits anything from the camera/Gemini
-    pipeline, so it can't be slowed down by it.
+    ToF sensors, check thresholds, resolve pacing/priority via a single
+    persistent HapticArbiter, and broadcast at most one direction per
+    cycle. Never awaits anything from the camera/Gemini pipeline, so it
+    can't be slowed down by it.
     """
     logger.info("Haptic loop started (poll_interval_s=%s)", poll_interval_s)
+    arbiter = HapticArbiter()
+    # Carried across cycles and fed back into check_thresholds() each time
+    # -- that's what gives its hysteresis continuity (which threshold
+    # applies to a direction depends on whether it was already triggered
+    # last cycle).
+    triggered: list = []
     while True:
         distances = tof_input.read_all_tof()
-        for direction in check_thresholds(distances):
-            # Unchanged, immediate, non-blocking -- the haptic buzz itself
-            # never waits on anything narration-related.
-            await broadcast_haptic(direction)
+        triggered = check_thresholds(distances, triggered)
+
+        for direction in triggered:
             if direction == "up":
+                # Unrelated to haptic pacing -- narration for overhead
+                # hazards has its own, separate throttle downstream in
+                # narration_worker.py, so this still fires every cycle
+                # "up" is triggered, regardless of what the arbiter
+                # decides for /ws/haptics below.
                 narration_queue.push_nowait({"source": "tof_up", "distance_m": distances["up"]})
+
+        direction_to_broadcast = arbiter.resolve(distances, triggered, time.monotonic())
+        if direction_to_broadcast is not None:
+            await broadcast_haptic(direction_to_broadcast)
+
         await asyncio.sleep(poll_interval_s)

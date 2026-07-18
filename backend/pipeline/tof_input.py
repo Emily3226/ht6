@@ -35,6 +35,19 @@ _DIP_START_CHANCE = 0.01
 _DIP_MIN_CALLS = 5
 _DIP_MAX_CALLS = 20
 
+# How much a dip's reading is allowed to wander, per call, around that
+# dip's own baseline distance. A real object sitting ~0.5m away for a
+# fraction of a second doesn't teleport across most of the 0.2-1.0m near
+# range between two ~15Hz polls -- but drawing a fresh independent
+# uniform(0.2, 1.0) on every call (the original approach) did exactly
+# that, so a single continuous dip could straddle a caller's near-distance
+# threshold (e.g. haptic_trigger's default 0.75m) many times per second,
+# making one physical "object approaching" event look like it was
+# repeatedly clearing and re-triggering. Small jitter around a fixed
+# per-dip baseline keeps consecutive readings within one dip close
+# together, so it reads as one continuous close approach instead.
+_DIP_JITTER_M = 0.05
+
 # Guards the shared per-direction dip state below. read_all_tof() is called
 # concurrently and at very different rates by the haptic loop (50-100Hz)
 # and the camera path (occasionally) -- without this lock, two calls
@@ -46,6 +59,7 @@ _DIP_MAX_CALLS = 20
 # just asyncio tasks.
 _lock = threading.Lock()
 _dip_remaining = {direction: 0 for direction in _DIRECTIONS}
+_dip_baseline_m = {direction: 0.0 for direction in _DIRECTIONS}
 
 
 def read_all_tof() -> dict:
@@ -56,18 +70,25 @@ def read_all_tof() -> dict:
     Each direction independently sits at a baseline of 2-4m most of the
     time, occasionally dipping to 0.2-1.0m for a handful of consecutive
     calls (simulating something approaching and then clearing) before
-    recovering. Safe to call rapidly and concurrently from multiple
-    callers at once.
+    recovering. Consecutive readings within the same dip stay close
+    together (jittered around that dip's own baseline distance, not
+    independently redrawn each call -- see _DIP_JITTER_M above), so one
+    continuous dip reads as one continuous close approach rather than
+    flickering across a threshold. Safe to call rapidly and concurrently
+    from multiple callers at once.
     """
     readings = {}
     with _lock:
         for direction in _DIRECTIONS:
             if _dip_remaining[direction] > 0:
                 _dip_remaining[direction] -= 1
-                readings[direction] = round(random.uniform(_NEAR_MIN_M, _NEAR_MAX_M), 2)
+                jittered = _dip_baseline_m[direction] + random.uniform(-_DIP_JITTER_M, _DIP_JITTER_M)
+                readings[direction] = round(min(_NEAR_MAX_M, max(_NEAR_MIN_M, jittered)), 2)
             elif random.random() < _DIP_START_CHANCE:
+                baseline = random.uniform(_NEAR_MIN_M, _NEAR_MAX_M)
+                _dip_baseline_m[direction] = baseline
                 _dip_remaining[direction] = random.randint(_DIP_MIN_CALLS, _DIP_MAX_CALLS) - 1
-                readings[direction] = round(random.uniform(_NEAR_MIN_M, _NEAR_MAX_M), 2)
+                readings[direction] = round(baseline, 2)
             else:
                 readings[direction] = round(random.uniform(_BASELINE_MIN_M, _BASELINE_MAX_M), 2)
     return readings

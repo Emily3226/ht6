@@ -37,8 +37,10 @@ Pipeline stages (see `pipeline/`):
 7. **narration_worker.py** -- consumes `narration_queue`, runs the shared
    throttle, calls `gemini_stage` or `narration_templates` depending on
    event source, and broadcasts the result.
-8. **haptic_trigger.py** -- `check_thresholds()`: stateless per-call check
-   of which ToF directions currently read too close.
+8. **haptic_trigger.py** -- `check_thresholds()`: which ToF directions
+   currently read too close, with hysteresis (two thresholds, not a time
+   delay) so sensor jitter around one distance can't flip a direction's
+   state every poll cycle.
 9. **haptic_loop.py** -- tight, independent polling loop driving the haptic
    reflex path; never imports `throttle.py` or `gemini_stage.py` (the
    narration_queue push for "up" triggers is fire-and-forget and adds no
@@ -88,26 +90,66 @@ arrives. You should see one roughly every few seconds in normal mock mode
 
 ## Haptic reflex path (`/ws/haptics`)
 
-Separate from everything above: a tight polling loop (`haptic_loop.py`,
-~15Hz) reads the three mock ToF sensors (`tof_input.py`) and broadcasts a
-message the instant any of them crosses a near-distance threshold --
+A tight polling loop (`haptic_loop.py`, ~15Hz) reads the three mock ToF
+sensors (`tof_input.py`) and checks thresholds (`haptic_trigger.py`), purely
+for low detection latency. What sits between detection and the actual
+`/ws/haptics` broadcast is `haptic_arbiter.HapticArbiter` (added
+2026-07-18), which paces and prioritizes what actually gets sent -- the
+message format itself is unchanged:
 
 ```json
 {"direction": "left"}
 ```
 
--- one message per triggered direction (`"left" | "right" | "up"`), not
-combined into a single payload. This is intentionally **not** throttled or
-deduped like the narration path: `haptic_trigger.check_thresholds()` is
-stateless by design (see its docstring) and `haptic_loop.py` never imports
-`throttle.py` or `gemini_stage.py`, so a slow Gemini call can never delay a
-haptic buzz. The only limit on `/ws/haptics` is a ~20 msgs/sec safety valve
-in `server.py` -- purely a guard against a runaway bug, not intentional UX
-throttling. The 15Hz poll rate is chosen to stay comfortably under that cap
-during ordinary sustained proximity (see `haptic_loop.py`'s comment for the
-arithmetic) -- a higher poll rate is more "instant" in theory but, since
-check_thresholds() never debounces, made the cap bind constantly during
-completely normal operation instead of only on genuine runaway behavior.
+**Threshold hysteresis (`haptic_trigger.py`, added 2026-07-18):** a
+direction becomes triggered the instant its distance drops below
+`TRIGGER_THRESHOLD_M` (0.75m) -- still immediate, no delay -- but only
+clears once it rises back above the higher `CLEAR_THRESHOLD_M` (0.90m),
+rather than clearing the moment a single reading crosses back over 0.75m.
+This exists because a sensor reading jittering around one physical
+object's real distance (e.g. wobbling between 0.7m and 0.85m) would
+otherwise flip triggered/cleared on every single ~15Hz poll, making one
+continuous hazard look like dozens of separate ones to everything
+downstream. `tof_input.py` separately smooths its own mock dip readings
+(one baseline distance per dip, jittered only slightly, rather than a
+fresh independent draw every call) to reduce how often a dip's readings
+wander across a threshold in the first place -- but hysteresis is what
+actually closes the remaining gap, since even smoothed readings can
+occasionally land close enough to a threshold to cross it. It's a
+distance-based band, not a time-based debounce, so it doesn't delay a
+genuinely new hazard's first trigger.
+
+**Why pacing was needed:** broadcasting on every ~15Hz poll cycle is far
+faster than the Apple Watch's Taptic Engine can physically play (each buzz
+runs ~1.5-2s) -- it was overstimulating. `HapticArbiter` fixes that with
+two rules, independent of `throttle.py`/`gemini_stage.py`/`narration_worker.py`
+(same as the rest of this path):
+
+- **Pacing, per direction:** the instant a direction transitions from
+  clear to triggered, it broadcasts immediately (edge-triggered). While it
+  stays triggered, it re-broadcasts at most once every
+  `haptic_arbiter.REMINDER_INTERVAL_SECONDS` (4s by default, measured
+  start-to-start). The instant it clears, its state fully resets -- a
+  later re-trigger is immediate again, never still "cooling down."
+- **Priority arbitration:** if multiple directions are triggered at once,
+  only the closest broadcasts. That direction **keeps** priority for as
+  long as it stays triggered, even if another direction becomes closer in
+  the meantime -- re-comparing distances every cycle would flicker the
+  winner back and forth if two hazards sit at near-equal distance and
+  jitter, which is worse than briefly favoring a slightly-stale pick.
+  Priority is only re-evaluated once the current winner clears, at which
+  point the next-closest still-triggered direction is promoted and
+  broadcasts **immediately** (no reminder delay) -- it was suppressed the
+  whole time, so the user was never actually warned about it yet.
+
+`haptic_loop.py`'s narration push for "up" triggers (see "Overhead hazard
+narration" below) is unaffected by any of this -- it still fires on every
+cycle "up" is triggered, since that path has its own separate throttle in
+`narration_worker.py`.
+
+`server.py`'s ~20 msgs/sec safety valve is unchanged and still purely a
+runaway-bug guard; with arbitration in place it's now even less likely to
+ever bind, since normal pacing tops out far below it on its own.
 
 Try it with:
 
@@ -116,8 +158,10 @@ source venv/bin/activate
 python test_haptic_client.py
 ```
 
-You should see occasional bursts of `{"direction": "..."}` messages with
-timestamps as the mock ToF sensors simulate something passing close by.
+You should see one `{"direction": "..."}` message the instant a sensor
+crosses threshold, then at most one more every ~4s while it stays close
+(not a burst on every poll tick), as the mock ToF sensors simulate
+something passing close by.
 
 ## Overhead hazard narration (no Gemini call)
 
