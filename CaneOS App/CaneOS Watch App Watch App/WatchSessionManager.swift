@@ -1,42 +1,25 @@
 import Foundation
 import WatchConnectivity
 import WatchKit
-
-/// Mirrors HapticIntensity from the phone side. watchOS has no Core Haptics for
-/// third-party apps, so "strength" is simulated via repeat count / interval.
-enum HapticIntensity: Int {
-    case light = 0
-    case medium = 1
-    case strong = 2
-
-    var repeatCount: Int {
-        switch self {
-        case .light: return 1
-        case .medium: return 2
-        case .strong: return 4
-        }
-    }
-
-    var repeatInterval: TimeInterval {
-        switch self {
-        case .light: return 0.0
-        case .medium: return 0.22
-        case .strong: return 0.18
-        }
-    }
-}
+internal import Combine
 
 final class WatchSessionManager: NSObject, ObservableObject, WCSessionDelegate {
     static let shared = WatchSessionManager()
-    @Published var lastDirection: String = "-"
 
-    private let intensityKey = "hapticIntensity"
-    private var intensity: HapticIntensity {
-        let raw = UserDefaults.standard.object(forKey: intensityKey) as? Int
-        return raw.flatMap(HapticIntensity.init(rawValue:)) ?? .medium
+    @Published var lastDirection: String = "-"
+    @Published var isPhoneReachable: Bool = false
+    @Published var sosActive: Bool = false
+
+    @Published var hapticIntensity: String = "medium" {
+        didSet { UserDefaults.standard.set(hapticIntensity, forKey: "watchHapticIntensity") }
+    }
+    @Published var audioEnabled: Bool = true {
+        didSet { UserDefaults.standard.set(audioEnabled, forKey: "watchAudioEnabled") }
     }
 
     private override init() {
+        hapticIntensity = UserDefaults.standard.string(forKey: "watchHapticIntensity") ?? "medium"
+        audioEnabled    = UserDefaults.standard.object(forKey: "watchAudioEnabled") as? Bool ?? true
         super.init()
         if WCSession.isSupported() {
             WCSession.default.delegate = self
@@ -44,7 +27,31 @@ final class WatchSessionManager: NSObject, ObservableObject, WCSessionDelegate {
         }
     }
 
-    func session(_ session: WCSession, activationDidCompleteWith state: WCSessionActivationState, error: Error?) {}
+    // MARK: - Public actions
+
+    func requestScan() {
+        let msg: [String: Any] = ["command": "scan_now"]
+        if WCSession.default.isReachable {
+            WCSession.default.sendMessage(msg, replyHandler: nil)
+        }
+        WKInterfaceDevice.current().play(.click)
+    }
+
+    func cancelSOS() {
+        sosActive = false
+        let msg: [String: Any] = ["type": "sos_cancel"]
+        if WCSession.default.isReachable {
+            WCSession.default.sendMessage(msg, replyHandler: nil)
+        } else {
+            WCSession.default.transferUserInfo(msg)
+        }
+    }
+
+    func dismissSOSOverlay() {
+        sosActive = false
+    }
+
+    // MARK: - Incoming message routing
 
     func session(_ session: WCSession, didReceiveMessage message: [String: Any]) {
         handle(message)
@@ -54,39 +61,60 @@ final class WatchSessionManager: NSObject, ObservableObject, WCSessionDelegate {
         handle(userInfo)
     }
 
-    // Settings changes arrive here (fire-and-forget, doesn't need the app foregrounded).
-    func session(_ session: WCSession, didReceiveApplicationContext applicationContext: [String: Any]) {
-        if let raw = applicationContext["hapticIntensity"] as? Int {
-            UserDefaults.standard.set(raw, forKey: intensityKey)
-        }
-    }
-
     private func handle(_ message: [String: Any]) {
-        guard let direction = message["direction"] as? String else { return }
         DispatchQueue.main.async {
-            self.lastDirection = direction
-            self.playHaptic(for: direction)
+            if let type = message["type"] as? String {
+                switch type {
+                case "sos_alert":
+                    if message["active"] as? Bool == true {
+                        self.sosActive = true
+                        WKInterfaceDevice.current().play(.failure)
+                    }
+                case "sos_clear":
+                    self.sosActive = false
+                default:
+                    break
+                }
+            }
+            if let direction = message["direction"] as? String {
+                self.lastDirection = direction
+                self.playHaptic(for: direction)
+            }
         }
     }
 
-    // Apple Watch only exposes preset haptic types -- no true variable-intensity
-    // patterns -- so each direction gets a distinct preset, repeated according to
-    // the user's chosen strength as a stand-in for real intensity control.
-    func playHaptic(for direction: String) {
+    // Apple Watch only exposes preset haptic types — no custom spatial patterns —
+    // so each direction maps to a distinct preset + timing combo as a stand-in.
+    private func playHaptic(for direction: String) {
         let device = WKInterfaceDevice.current()
-        let type: WKHapticType
-        switch direction {
-        case "left": type = .directionDown
-        case "right": type = .directionUp
-        case "up": type = .notification
-        case "down": type = .failure // distinct pattern for drop-off warning
-        default: type = .click
-        }
+        let intensity = hapticIntensity
 
-        let settings = intensity
-        for i in 0..<settings.repeatCount {
-            let delay = Double(i) * settings.repeatInterval
-            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { device.play(type) }
+        switch direction {
+        case "left":
+            device.play(.directionDown)
+            if intensity == "high" {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { device.play(.directionDown) }
+            }
+        case "right":
+            device.play(.directionUp)
+            if intensity == "high" {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { device.play(.directionUp) }
+            }
+        case "up":
+            device.play(.notification)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { device.play(.notification) }
+        case "down":
+            device.play(.failure)
+        default:
+            if intensity != "low" { device.play(.click) }
         }
+    }
+
+    // MARK: - WCSessionDelegate
+
+    func session(_ session: WCSession, activationDidCompleteWith state: WCSessionActivationState, error: Error?) {}
+
+    func sessionReachabilityDidChange(_ session: WCSession) {
+        DispatchQueue.main.async { self.isPhoneReachable = session.isReachable }
     }
 }

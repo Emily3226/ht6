@@ -3,6 +3,7 @@ import Foundation
 final class CaneConnection: NSObject, URLSessionWebSocketDelegate {
     private var webSocketTask: URLSessionWebSocketTask?
     var onMessage: ((CaneMessage) -> Void)?
+    var onConnectionChange: ((Bool) -> Void)?
 
     func connect(to urlString: String) {
         guard let url = URL(string: urlString) else { return }
@@ -10,6 +11,14 @@ final class CaneConnection: NSObject, URLSessionWebSocketDelegate {
         webSocketTask = session.webSocketTask(with: url)
         webSocketTask?.resume()
         listen()
+    }
+
+    func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask, didOpenWithProtocol protocol: String?) {
+        DispatchQueue.main.async { self.onConnectionChange?(true) }
+    }
+
+    func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask, didCloseWith closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?) {
+        DispatchQueue.main.async { self.onConnectionChange?(false) }
     }
 
     private func listen() {
@@ -21,9 +30,10 @@ final class CaneConnection: NSObject, URLSessionWebSocketDelegate {
                    let event = try? JSONDecoder().decode(CaneMessage.self, from: data) {
                     self?.onMessage?(event)
                 }
-                self?.listen() // keep listening for the next message
+                self?.listen()
             case .failure(let error):
                 print("Cane connection error: \(error.localizedDescription)")
+                DispatchQueue.main.async { self?.onConnectionChange?(false) }
             }
         }
     }

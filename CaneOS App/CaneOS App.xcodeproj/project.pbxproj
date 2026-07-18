@@ -47,7 +47,7 @@
 		};
 		B7205432300B3E2F0082E536 /* CaneOS Watch App */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
-			path = "CaneOS Watch App";
+			path = "CaneOS Watch App Watch App";
 			sourceTree = "<group>";
 		};
 /* End PBXFileSystemSynchronizedRootGroup section */
