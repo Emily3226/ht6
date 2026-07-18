@@ -268,8 +268,8 @@ struct ContentView: View {
             try await sosManager.sendEmergencyAlert(
                 to: contactsManager.contacts,
                 location: location,
-                resendAPIKey: Config.resendAPIKey,
-                fromEmail: Config.resendFromEmail
+                backendURL: Config.atlasDataAPIURL,
+                backendAPIKey: Config.atlasAPIKey
             )
 
             // Keep contacts updated with a fresh location text every
@@ -277,8 +277,8 @@ struct ContentView: View {
             // static pin from the moment it fired.
             sosManager.startLiveUpdates(
                 to: contactsManager.contacts,
-                resendAPIKey: Config.resendAPIKey,
-                fromEmail: Config.resendFromEmail
+                backendURL: Config.atlasDataAPIURL,
+                backendAPIKey: Config.atlasAPIKey
             )
         } catch {
             sosErrorMessage = error.localizedDescription
