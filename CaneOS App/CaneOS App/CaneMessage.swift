@@ -16,7 +16,7 @@ import Foundation
 // Deliberately has NO other fields (no hazard_type/urgency/spoken_description) --
 // that richness lives on /ws/hazards, not here.
 
-enum HapticSensorDirection: String, Decodable {
+enum HapticSensorDirection: String, Decodable, CaseIterable {
     case left, right, up
 }
 

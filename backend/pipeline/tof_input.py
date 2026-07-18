@@ -62,6 +62,22 @@ _dip_remaining = {direction: 0 for direction in _DIRECTIONS}
 _dip_baseline_m = {direction: 0.0 for direction in _DIRECTIONS}
 
 
+def force_dip(direction: str, distance_m: float = 0.5, calls: int = 25) -> None:
+    """
+    Manually start a dip on one mock sensor, as if a real object just came
+    within `distance_m`. Used by the /simulate/tof/{direction} endpoint so
+    the phone app can rehearse the full sensor -> haptic/narration flow on
+    demand. At the haptic loop's ~15Hz poll, 25 calls ≈ 1.7s of sustained
+    near readings -- comfortably enough for haptic_trigger's hysteresis to
+    latch the direction.
+    """
+    if direction not in _DIRECTIONS:
+        raise ValueError(f"direction must be one of {_DIRECTIONS}, got {direction!r}")
+    with _lock:
+        _dip_baseline_m[direction] = distance_m
+        _dip_remaining[direction] = calls
+
+
 def read_all_tof() -> dict:
     """
     Returns the current mock distance reading (meters) for each of the

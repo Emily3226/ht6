@@ -52,10 +52,18 @@ struct ContentView: View {
     @StateObject private var contactsManager = EmergencyContactsManager.shared
     @StateObject private var settings        = AppSettings.shared
     @StateObject private var incidents       = IncidentStore.shared
+    @StateObject private var auth            = AuthManager.shared
 
-    @State private var caneConnection      = CaneConnection()
+    // Three independent sockets, matching the backend's split:
+    // /ws/haptics -- immediate, unthrottled, 3-value direction only.
+    // /ws/hazards -- richer, throttled by the backend, drives audio/UI.
+    // /ws/status  -- camera health transitions only (offline/restored).
+    @State private var hapticsConnection   = CaneSocketConnection<HapticMessage>()
+    @State private var hazardsConnection   = CaneSocketConnection<CaneHazardChannelEvent>()
+    @State private var statusConnection    = CaneSocketConnection<StatusMessage>()
     @State private var sosManager          = SOSManager()
-    @State private var lastHazard: CaneMessage?
+    @State private var lastHazard: HazardMessage?
+    @State private var cameraStatus: CameraStatusEvent?
     @State private var isScanning          = false
     @State private var isHardwareConnected = false
     @State private var sosCountdown: Int?  = nil
@@ -64,16 +72,41 @@ struct ContentView: View {
     @State private var pendingSOSIncidentId: UUID?
 
     private let elevenLabs = ElevenLabsClient(apiKey: Config.elevenLabsAPIKey, voiceId: Config.elevenLabsVoiceId)
+    private let backboard  = BackboardClient(apiKey: Config.backboardAPIKey)
 
     var body: some View {
+        // Launch flow: hold on a splash while the stored Auth0 session
+        // restores → sign in → pick a role (account setup) → the app.
+        Group {
+            if auth.isRestoring {
+                ZStack {
+                    Color.caneNavy.ignoresSafeArea()
+                    VStack(spacing: 16) {
+                        CaneMarkView(height: 64, color: .caneBlue)
+                        ProgressView().tint(.caneBlue)
+                    }
+                }
+            } else if !auth.isAuthenticated {
+                WelcomeView(auth: auth)
+            } else if settings.userRole == nil {
+                RoleSelectionView(auth: auth, settings: settings)
+            } else {
+                mainTabs
+            }
+        }
+        .onChange(of: settings.locationSharingEnabled) { syncLocationSharing() }
+        .onChange(of: settings.userRole) { syncLocationSharing() }
+        .onChange(of: auth.isAuthenticated) { syncLocationSharing() }
+    }
+
+    private var mainTabs: some View {
         TabView {
             NavigationStack {
                 HomeView(
                     isConnected: isHardwareConnected,
                     isWatchConnected: phoneSession.isWatchConnected,
                     lastHazard: lastHazard,
-                    isScanning: isScanning,
-                    onScan: requestSceneDescription,
+                    cameraStatus: cameraStatus,
                     onRefresh: { phoneSession.refreshWatchReachability() }
                 )
                 .navigationBarTitleDisplayMode(.inline)
@@ -93,14 +126,36 @@ struct ContentView: View {
             }
             .tabItem { Label("Home", systemImage: "house.fill") }
 
+            if settings.userRole == .support {
+                NavigationStack {
+                    SupportMapView(settings: settings)
+                        .navigationTitle("Location")
+                        .toolbarBackground(Color.caneNavy, for: .navigationBar)
+                        .toolbarColorScheme(.dark, for: .navigationBar)
+                }
+                .tabItem { Label("Location", systemImage: "map.fill") }
+            }
+
             NavigationStack {
-                SettingsView(settings: settings)
-                    .navigationTitle("Settings")
+                SettingsView(
+                    settings: settings,
+                    auth: auth,
+                    isScanning: isScanning,
+                    onScan: requestSceneDescription,
+                    onTestHaptic: { direction in
+                        phoneSession.sendHaptic(direction)
+                        // Spoken cue alongside the buzz — also doubles as a
+                        // live test of the ElevenLabs → playback pipeline.
+                        Task { await speakAndPlay(direction.rawValue.capitalized) }
+                    },
+                    onSimulate: simulateBackendEvent
+                )
+                .navigationTitle("Settings")
             }
             .tabItem { Label("Settings", systemImage: "slider.horizontal.3") }
 
             NavigationStack {
-                SafetyView(contactsManager: contactsManager, onSOS: startSOSSequence)
+                SafetyView(contactsManager: contactsManager, onSOS: fireManualSOS)
                     .navigationTitle("Safety")
             }
             .tabItem { Label("Safety", systemImage: "sos.circle.fill") }
@@ -112,7 +167,10 @@ struct ContentView: View {
             .tabItem { Label("History", systemImage: "clock.fill") }
         }
         .tint(.caneBlue)
-        .onAppear(perform: connectToBackend)
+        .onAppear {
+            connectToBackend()
+            syncLocationSharing()
+        }
         .overlay {
             if let countdown = sosCountdown {
                 SOSCountdownOverlay(countdown: countdown, onCancel: cancelSOS)
@@ -133,37 +191,63 @@ struct ContentView: View {
         }
     }
 
+    /// Publishes live location to Atlas only while a signed-in primary user
+    /// has the sharing toggle on.
+    private func syncLocationSharing() {
+        if auth.isAuthenticated,
+           settings.userRole == .primary,
+           settings.locationSharingEnabled {
+            LocationSharingManager.shared.start()
+        } else {
+            LocationSharingManager.shared.stop()
+        }
+    }
+
     // MARK: - Backend wiring
 
     private func connectToBackend() {
-        caneConnection.onConnectionChange = { connected in
+        // /ws/haptics: immediate, unthrottled. The handler does exactly one
+        // thing -- forward the buzz -- with nothing else on the path (no
+        // logging, no async work, no awaiting) so nothing here adds latency
+        // between the sensor firing on the backend and the Watch buzzing.
+        hapticsConnection.onMessage = { message in
+            phoneSession.sendHaptic(message.direction)
+        }
+        hapticsConnection.connect(to: Config.hapticsWebSocketURL)
+
+        // /ws/hazards: richer, backend-throttled. Drives the UI, TTS, SOS,
+        // and incident history.
+        hazardsConnection.onConnectionChange = { connected in
             isHardwareConnected = connected
         }
-        caneConnection.onMessage = { message in
+        hazardsConnection.onMessage = { event in
             Task { @MainActor in
-                switch message.type {
-                case "hazard":            handleHazard(message)
-                case "scene_description": await handleSceneDescription(message)
-                default: break
+                switch event {
+                case .hazard(let hazard):
+                    handleHazard(hazard)
+                case .sceneDescription(let text):
+                    await handleSceneDescription(text)
                 }
             }
         }
-        caneConnection.connect(to: Config.backendWebSocketURL)
+        hazardsConnection.connect(to: Config.hazardsWebSocketURL)
+
+        // /ws/status: camera health transitions only. Drives the Home tab's
+        // camera pill; nothing safety-critical hangs off this.
+        statusConnection.onMessage = { message in
+            Task { @MainActor in cameraStatus = message.event }
+        }
+        statusConnection.connect(to: Config.statusWebSocketURL)
     }
 
-    private func handleHazard(_ hazard: CaneMessage) {
+    private func handleHazard(_ hazard: HazardMessage) {
         lastHazard = hazard
         isScanning = false
         let incidentId = incidents.log(
-            hazardType: hazard.hazardType ?? "unknown",
-            direction:  hazard.direction  ?? "-",
-            urgency:    hazard.urgency    ?? "-"
+            hazardType: hazard.hazardType,
+            direction:  hazard.direction.rawValue,
+            urgency:    hazard.urgency
         )
-
-        if let dir = hazard.direction,
-           let hDir = PhoneSessionManager.HapticDirection(rawValue: dir) {
-            phoneSession.sendHaptic(hDir)
-        }
 
         if hazard.urgency == "high" {
             // High-urgency hazards trigger the SOS flow, which fetches location
@@ -177,11 +261,13 @@ struct ContentView: View {
             Task {
                 if let location = try? await sosManager.requestLocation() {
                     incidents.attachLocation(location, toIncidentWithId: incidentId)
+                    await announceRepeatHazardIfAny(hazard, at: location, incidentId: incidentId)
                 }
             }
         }
 
-        guard settings.audioEnabled, let desc = hazard.spokenDescription else { return }
+        guard settings.audioEnabled else { return }
+        let desc = hazard.spokenDescription
 
         if hazard.urgency == "high" {
             // TTS and SOS fire in parallel — UI countdown runs concurrently with audio
@@ -191,6 +277,36 @@ struct ContentView: View {
         } else {
             Task { await speakAndPlay(desc) }
         }
+    }
+
+    /// Checks Atlas ($geoNear on the incident log) for past incidents of the
+    /// same hazard type within ~40 m and, if any exist, speaks a "you've
+    /// encountered this here before" callback after the main narration.
+    private func announceRepeatHazardIfAny(_ hazard: HazardMessage,
+                                           at location: CLLocation,
+                                           incidentId: UUID) async {
+        guard settings.audioEnabled,
+              let uid = AuthManager.shared.userId else { return }
+        let repeats = await incidents.nearbyRepeatCount(
+            hazardType: hazard.hazardType,
+            latitude: location.coordinate.latitude,
+            longitude: location.coordinate.longitude,
+            excluding: incidentId,
+            userId: uid
+        )
+        guard repeats > 0 else { return }
+        let hazardName = hazard.hazardType.replacingOccurrences(of: "_", with: " ")
+        let times = repeats == 1 ? "once" : "\(repeats) times"
+        await speakAndPlay("Heads up — you've encountered a \(hazardName) at this spot \(times) before.")
+    }
+
+    /// Manual SOS from the hold-button: the 3-second hold ring *is* the
+    /// confirmation, so this fires immediately with no extra countdown.
+    /// (Hazard-triggered SOS keeps the countdown via startSOSSequence,
+    /// because there the user never made a deliberate gesture to cancel.)
+    private func fireManualSOS() {
+        guard sosCountdown == nil else { return }
+        Task { await fireSOS() }
     }
 
     private func startSOSSequence() {
@@ -213,6 +329,7 @@ struct ContentView: View {
         sosTask = nil
         sosCountdown = nil
         phoneSession.sendSOSClear()
+        sosManager.stopLiveUpdates()
     }
 
     private func fireSOS() async {
@@ -230,22 +347,57 @@ struct ContentView: View {
 
             try await sosManager.sendEmergencyAlert(
                 to: contactsManager.contacts,
-                location: location
+                location: location,
+                backendURL: Config.atlasDataAPIURL,
+                backendAPIKey: Config.atlasAPIKey
+            )
+
+            // Keep contacts updated with a fresh location text every
+            // ~90s for as long as the SOS stays active, instead of one
+            // static pin from the moment it fired.
+            sosManager.startLiveUpdates(
+                to: contactsManager.contacts,
+                backendURL: Config.atlasDataAPIURL,
+                backendAPIKey: Config.atlasAPIKey
             )
         } catch {
             sosErrorMessage = error.localizedDescription
         }
     }
 
-    private func requestSceneDescription() {
-        isScanning = true
-        caneConnection.sendCommand("scan_now")
+    /// Asks the Python backend to fake a ToF sensor event. The backend
+    /// forces a dip on that mock sensor and (for left/right) queues a fake
+    /// camera detection, so the buzz and the plain-English narration arrive
+    /// back through the real WebSocket pipeline — a full end-to-end
+    /// rehearsal with nothing stubbed on the app side.
+    private func simulateBackendEvent(_ direction: HapticSensorDirection) async -> Bool {
+        guard let url = URL(string: "\(Config.pipelineBaseURL)/simulate/tof/\(direction.rawValue)") else {
+            return false
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        do {
+            let (_, response) = try await URLSession.shared.data(for: request)
+            return (response as? HTTPURLResponse)?.statusCode == 200
+        } catch {
+            print("[Simulate] request failed: \(error.localizedDescription)")
+            return false
+        }
     }
 
-    private func handleSceneDescription(_ message: CaneMessage) async {
+    private func requestSceneDescription() {
+        isScanning = true
+        hazardsConnection.sendCommand("scan_now")
+    }
+
+    private func handleSceneDescription(_ text: String) async {
         isScanning = false
-        guard let text = message.text else { return }
-        await speakAndPlay(text)
+        do {
+            let reply = try await backboard.send(text: text)
+            await speakAndPlay(reply)
+        } catch {
+            await speakAndPlay(text)
+        }
     }
 
     private func speakAndPlay(_ text: String) async {
@@ -263,9 +415,8 @@ struct ContentView: View {
 struct HomeView: View {
     let isConnected: Bool
     let isWatchConnected: Bool
-    let lastHazard: CaneMessage?
-    let isScanning: Bool
-    let onScan: () -> Void
+    let lastHazard: HazardMessage?
+    let cameraStatus: CameraStatusEvent?
     let onRefresh: () async -> Void
 
     var body: some View {
@@ -275,8 +426,8 @@ struct HomeView: View {
                 VStack(spacing: 20) {
                     statusCard
                     watchPill
+                    if cameraStatus == .cameraOffline { cameraOfflinePill }
                     if let hazard = lastHazard { lastAlertCard(hazard) }
-                    scanButton
                 }
                 .padding()
             }
@@ -344,7 +495,29 @@ struct HomeView: View {
             : "Apple Watch not reachable")
     }
 
-    private func lastAlertCard(_ hazard: CaneMessage) -> some View {
+    private var cameraOfflinePill: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "video.slash.fill")
+                .font(.title3)
+                .foregroundColor(.orange)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Camera Offline")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundColor(.white)
+                Text("Obstacle narration unavailable — haptics still active")
+                    .font(.caption)
+                    .foregroundColor(Color(white: 0.50))
+            }
+            Spacer()
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+        .background(Color.caneCard)
+        .cornerRadius(14)
+        .accessibilityLabel("Camera offline. Obstacle narration unavailable, haptics still active.")
+    }
+
+    private func lastAlertCard(_ hazard: HazardMessage) -> some View {
         HStack(spacing: 14) {
             Image(systemName: "exclamationmark.triangle.fill")
                 .foregroundColor(.yellow)
@@ -354,10 +527,10 @@ struct HomeView: View {
                     .font(.caption)
                     .foregroundColor(Color(white: 0.50))
                     .textCase(.uppercase)
-                Text(hazard.hazardType?.capitalized ?? "Hazard")
+                Text(hazard.hazardType.capitalized)
                     .font(.headline)
                     .foregroundColor(.white)
-                Text("\(hazard.direction ?? "-") · \(hazard.urgency ?? "-") urgency")
+                Text("\(hazard.direction.rawValue) · \(hazard.urgency) urgency")
                     .font(.subheadline)
                     .foregroundColor(Color(white: 0.60))
             }
@@ -367,28 +540,7 @@ struct HomeView: View {
         .background(Color.caneCard)
         .cornerRadius(16)
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("Last alert: \(hazard.hazardType ?? "hazard"), \(hazard.direction ?? "unknown direction"), \(hazard.urgency ?? "unknown") urgency")
-    }
-
-    private var scanButton: some View {
-        Button(action: onScan) {
-            HStack(spacing: 12) {
-                Image(systemName: isScanning ? "camera.fill" : "camera.viewfinder")
-                    .font(.title2)
-                Text(isScanning ? "Scanning…" : "What's around me?")
-                    .font(.headline)
-            }
-            .frame(maxWidth: .infinity)
-            .padding(.vertical, 20)
-            .background(isScanning ? Color(white: 0.20) : Color.caneBlue)
-            .foregroundColor(.white)
-            .cornerRadius(16)
-        }
-        .disabled(isScanning)
-        .accessibilityLabel(isScanning
-            ? "Scanning environment, please wait"
-            : "What's around me, scan environment")
-        .accessibilityHint("Triggers a camera scan and spoken audio description of your surroundings")
+        .accessibilityLabel("Last alert: \(hazard.hazardType), \(hazard.direction.rawValue), \(hazard.urgency) urgency")
     }
 }
 
@@ -396,60 +548,306 @@ struct HomeView: View {
 
 struct SettingsView: View {
     @ObservedObject var settings: AppSettings
+    @ObservedObject var auth: AuthManager
+    let isScanning: Bool
+    let onScan: () -> Void
+    let onTestHaptic: (HapticSensorDirection) -> Void
+    let onSimulate: (HapticSensorDirection) async -> Bool
+
+    @State private var lastTestSent: HapticSensorDirection?
+    @State private var isSimulating = false
+    @State private var simulateResult: String?
 
     var body: some View {
         ZStack {
             Color.caneNavy.ignoresSafeArea()
             List {
+                // MARK: Mode (both roles) — switchable anytime
                 Section {
-                    settingRow(
-                        title: "Haptic Intensity",
-                        hint: "Adjusts vibration strength on the clip module. Currently \(settings.hapticIntensity.label)"
-                    ) {
-                        Picker("Haptic Intensity", selection: $settings.hapticIntensity) {
-                            ForEach(AppSettings.HapticIntensity.allCases) { level in
-                                Text(level.label).tag(level)
-                            }
+                    Picker("Mode", selection: Binding(
+                        get: { settings.userRole ?? .primary },
+                        set: { settings.userRole = $0 }
+                    )) {
+                        ForEach(UserRole.allCases) { role in
+                            Text(role.label).tag(role)
                         }
-                        .pickerStyle(.segmented)
                     }
+                    .pickerStyle(.segmented)
+                    .listRowBackground(Color.caneCard)
+                    .accessibilityLabel("App mode: \(settings.userRole?.label ?? "not set")")
+                    .accessibilityHint("Switches between the visually impaired experience and the support partner experience")
                 } header: {
-                    sectionHeader(icon: "waveform.path", title: "Vibration")
+                    sectionHeader(icon: "person.crop.rectangle.stack", title: "Mode")
                 }
 
-                Section {
-                    settingRow(
-                        title: "Detection Sensitivity",
-                        hint: "Controls how aggressively the sensor flags movement. Currently \(settings.sensitivityLevel.label)"
-                    ) {
-                        Picker("Sensitivity", selection: $settings.sensitivityLevel) {
-                            ForEach(AppSettings.SensitivityLevel.allCases) { level in
-                                Text(level.label).tag(level)
+                if settings.userRole == .primary {
+                    Section {
+                        settingRow(
+                            title: "Haptic Intensity",
+                            hint: "Adjusts vibration strength on the clip module. Currently \(settings.hapticIntensity.label)"
+                        ) {
+                            Picker("Haptic Intensity", selection: $settings.hapticIntensity) {
+                                ForEach(AppSettings.HapticIntensity.allCases) { level in
+                                    Text(level.label).tag(level)
+                                }
+                            }
+                            .pickerStyle(.segmented)
+                        }
+                    } header: {
+                        sectionHeader(icon: "waveform.path", title: "Vibration")
+                    }
+
+                    Section {
+                        settingRow(
+                            title: "Detection Sensitivity",
+                            hint: "Controls how aggressively the sensor flags movement. Currently \(settings.sensitivityLevel.label)"
+                        ) {
+                            Picker("Sensitivity", selection: $settings.sensitivityLevel) {
+                                ForEach(AppSettings.SensitivityLevel.allCases) { level in
+                                    Text(level.label).tag(level)
+                                }
+                            }
+                            .pickerStyle(.segmented)
+                        }
+                    } header: {
+                        sectionHeader(icon: "sensor.tag.radiowaves.forward", title: "Sensor")
+                    }
+
+                    Section {
+                        Toggle(isOn: $settings.audioEnabled) {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("Hazard Narration")
+                                    .font(.body.weight(.semibold))
+                                    .foregroundColor(.white)
+                                Text("Spoken obstacle descriptions via headphones")
+                                    .font(.caption)
+                                    .foregroundColor(Color(white: 0.55))
                             }
                         }
-                        .pickerStyle(.segmented)
+                        .tint(.caneBlue)
+                        .listRowBackground(Color.caneCard)
+                        .accessibilityLabel("Hazard audio narration \(settings.audioEnabled ? "on" : "off")")
+                        .accessibilityHint("Toggles spoken descriptions for detected obstacles")
+                    } header: {
+                        sectionHeader(icon: "speaker.wave.2.fill", title: "Audio")
                     }
-                } header: {
-                    sectionHeader(icon: "sensor.tag.radiowaves.forward", title: "Sensor")
+
+                    // MARK: Location sharing (primary role only)
+                    Section {
+                        Toggle(isOn: $settings.locationSharingEnabled) {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("Share Live Location")
+                                    .font(.body.weight(.semibold))
+                                    .foregroundColor(.white)
+                                Text("Lets your support partner see where you are on their map")
+                                    .font(.caption)
+                                    .foregroundColor(Color(white: 0.55))
+                            }
+                        }
+                        .tint(.caneBlue)
+                        .listRowBackground(Color.caneCard)
+                        .accessibilityLabel("Live location sharing \(settings.locationSharingEnabled ? "on" : "off")")
+                        .accessibilityHint("When on, your support partner can follow your location on a map. Turn off anytime.")
+
+                        HStack {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("Your share code")
+                                    .font(.body.weight(.semibold))
+                                    .foregroundColor(.white)
+                                Text("Your support partner enters this in their app")
+                                    .font(.caption)
+                                    .foregroundColor(Color(white: 0.55))
+                            }
+                            Spacer()
+                            Text(settings.shareCode)
+                                .font(.system(size: 20, weight: .bold, design: .monospaced))
+                                .foregroundColor(.caneBlue)
+                                .textSelection(.enabled)
+                        }
+                        .listRowBackground(Color.caneCard)
+                        .accessibilityElement(children: .combine)
+                        .accessibilityLabel("Your share code is \(settings.shareCode.map(String.init).joined(separator: " "))")
+                    } header: {
+                        sectionHeader(icon: "location.fill", title: "Location Sharing")
+                    }
                 }
 
+                if settings.userRole == .support {
+                    Section {
+                        HStack {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("Following code")
+                                    .font(.body.weight(.semibold))
+                                    .foregroundColor(.white)
+                                Text("Set or change it from the Location tab")
+                                    .font(.caption)
+                                    .foregroundColor(Color(white: 0.55))
+                            }
+                            Spacer()
+                            Text(settings.followCode.isEmpty ? "—" : settings.followCode)
+                                .font(.system(size: 20, weight: .bold, design: .monospaced))
+                                .foregroundColor(settings.followCode.isEmpty ? Color(white: 0.40) : .caneBlue)
+                        }
+                        .listRowBackground(Color.caneCard)
+                        .accessibilityElement(children: .combine)
+                        .accessibilityLabel(settings.followCode.isEmpty
+                            ? "Not following anyone yet. Set a share code from the Location tab."
+                            : "Following share code \(settings.followCode.map(String.init).joined(separator: " "))")
+                    } header: {
+                        sectionHeader(icon: "map.fill", title: "Following")
+                    }
+                }
+
+                // MARK: Account (profile + Atlas sync; sign-in itself
+                // happens on the launch screen, before the app is shown)
                 Section {
-                    Toggle(isOn: $settings.audioEnabled) {
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text("Hazard Narration")
+                    HStack(spacing: 12) {
+                        if let picture = auth.userPicture {
+                            AsyncImage(url: picture) { image in
+                                image.resizable()
+                            } placeholder: {
+                                Circle().fill(Color(white: 0.20))
+                            }
+                            .frame(width: 44, height: 44)
+                            .clipShape(Circle())
+                            .overlay(Circle().stroke(Color.caneBlue.opacity(0.6), lineWidth: 1.5))
+                        }
+                        VStack(alignment: .leading, spacing: 5) {
+                            if let name = auth.userName {
+                                Text(name)
+                                    .font(.body.weight(.semibold))
+                                    .foregroundColor(.white)
+                            }
+                            if let email = auth.userEmail {
+                                Text(email)
+                                    .font(.caption)
+                                    .foregroundColor(Color(white: 0.55))
+                            }
+                            Text("Requests verified by Auth0 · data in MongoDB Atlas")
+                                .font(.system(size: 10))
+                                .foregroundColor(Color(white: 0.40))
+                        }
+                    }
+                    .padding(.vertical, 2)
+                    .listRowBackground(Color.caneCard)
+
+                    Button {
+                        Task { await auth.syncToCloud() }
+                    } label: {
+                        HStack(spacing: 8) {
+                            if auth.isSyncing {
+                                ProgressView().tint(.caneBlue)
+                            } else {
+                                Image(systemName: "arrow.triangle.2.circlepath")
+                                    .foregroundColor(.caneBlue)
+                            }
+                            Text(auth.isSyncing ? "Syncing…" : "Sync now")
+                                .foregroundColor(.white)
+                        }
+                    }
+                    .disabled(auth.isSyncing)
+                    .listRowBackground(Color.caneCard)
+                    .accessibilityLabel("Sync contacts and settings to cloud")
+
+                    Button(role: .destructive) {
+                        Task { await auth.logout() }
+                    } label: {
+                        Text("Sign Out")
+                            .frame(maxWidth: .infinity, alignment: .center)
+                            .font(.body.weight(.semibold))
+                    }
+                    .listRowBackground(Color.caneCard)
+                } header: {
+                    sectionHeader(icon: "person.crop.circle.fill", title: "Account")
+                }
+
+                // MARK: Testing & demo tools (both roles)
+                Section {
+                    // Full end-to-end rehearsal: fake ToF data on the Python
+                    // backend → real pipeline → narration + Watch buzz arrive
+                    // over the WebSockets like any genuine event.
+                    Button {
+                        guard !isSimulating else { return }
+                        isSimulating = true
+                        simulateResult = nil
+                        let direction = HapticSensorDirection.allCases.randomElement()!
+                        Task {
+                            let ok = await onSimulate(direction)
+                            isSimulating = false
+                            simulateResult = ok
+                                ? "Sent \(direction.rawValue) — listen for the narration and buzz"
+                                : "Couldn't reach the backend — is the Python server running?"
+                        }
+                    } label: {
+                        HStack(spacing: 10) {
+                            if isSimulating {
+                                ProgressView().tint(.white)
+                            } else {
+                                Image(systemName: "bolt.fill")
+                            }
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(isSimulating ? "Simulating…" : "Simulate Hazard Event")
+                                    .font(.body.weight(.semibold))
+                                if let result = simulateResult {
+                                    Text(result)
+                                        .font(.caption)
+                                        .foregroundColor(Color(white: 0.75))
+                                }
+                            }
+                            Spacer()
+                        }
+                        .foregroundColor(.white)
+                        .padding(.vertical, 4)
+                    }
+                    .listRowBackground(Color.caneBlue.opacity(isSimulating ? 0.4 : 0.85))
+                    .accessibilityLabel("Simulate a hazard event")
+                    .accessibilityHint("Fakes a sensor reading on the backend. A spoken description and a watch buzz should follow within a few seconds.")
+
+                    // On-demand scene scan
+                    Button(action: onScan) {
+                        HStack(spacing: 10) {
+                            Image(systemName: isScanning ? "camera.fill" : "camera.viewfinder")
+                            Text(isScanning ? "Scanning…" : "What's around me?")
+                                .font(.body.weight(.semibold))
+                            Spacer()
+                        }
+                        .foregroundColor(.white)
+                        .padding(.vertical, 4)
+                    }
+                    .disabled(isScanning)
+                    .listRowBackground(Color.caneCard)
+                    .accessibilityLabel(isScanning
+                        ? "Scanning environment, please wait"
+                        : "What's around me, scan environment")
+                    .accessibilityHint("Triggers a camera scan and spoken audio description of your surroundings")
+
+                    // Direct phone → Watch haptic tests (skips the backend)
+                    VStack(spacing: 10) {
+                        HStack {
+                            Text("Test Watch haptics")
                                 .font(.body.weight(.semibold))
                                 .foregroundColor(.white)
-                            Text("Spoken obstacle descriptions via headphones")
-                                .font(.caption)
-                                .foregroundColor(Color(white: 0.55))
+                            Spacer()
+                            if let sent = lastTestSent {
+                                Text("Sent: \(sent.rawValue)")
+                                    .font(.caption)
+                                    .foregroundColor(Color(white: 0.55))
+                            }
                         }
+                        HStack(spacing: 10) {
+                            hapticTestButton(.left,  icon: "arrow.turn.up.left",  label: "Left")
+                            hapticTestButton(.up,    icon: "arrow.up",            label: "Up")
+                            hapticTestButton(.right, icon: "arrow.turn.up.right", label: "Right")
+                        }
+                        Text("Buzzes your Apple Watch and speaks the direction. Keep the Watch app open.")
+                            .font(.caption2)
+                            .foregroundColor(Color(white: 0.45))
+                            .frame(maxWidth: .infinity, alignment: .leading)
                     }
-                    .tint(.caneBlue)
+                    .padding(.vertical, 6)
                     .listRowBackground(Color.caneCard)
-                    .accessibilityLabel("Hazard audio narration \(settings.audioEnabled ? "on" : "off")")
-                    .accessibilityHint("Toggles spoken descriptions for detected obstacles")
                 } header: {
-                    sectionHeader(icon: "speaker.wave.2.fill", title: "Audio")
+                    sectionHeader(icon: "wrench.and.screwdriver.fill", title: "Testing & Demo")
                 }
             }
             .listStyle(.plain)
@@ -457,6 +855,28 @@ struct SettingsView: View {
         }
         .toolbarBackground(Color.caneNavy, for: .navigationBar)
         .toolbarColorScheme(.dark, for: .navigationBar)
+    }
+
+    private func hapticTestButton(_ direction: HapticSensorDirection,
+                                  icon: String, label: String) -> some View {
+        Button {
+            lastTestSent = direction
+            onTestHaptic(direction)
+        } label: {
+            VStack(spacing: 6) {
+                Image(systemName: icon)
+                    .font(.title3)
+                Text(label)
+                    .font(.caption.weight(.semibold))
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 12)
+            .background(Color.caneNavy.opacity(0.6))
+            .foregroundColor(.white)
+            .cornerRadius(12)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Test \(label) haptic on Apple Watch")
     }
 
     private func sectionHeader(icon: String, title: String) -> some View {
@@ -1223,7 +1643,9 @@ struct SOSCountdownOverlay: View {
 
 struct HistoryView: View {
     @ObservedObject var store: IncidentStore
+    @ObservedObject private var auth = AuthManager.shared
     @Environment(\.openURL) private var openURL
+    @State private var insights: IncidentStore.Insights?
 
     private static let formatter: DateFormatter = {
         let f = DateFormatter()
@@ -1246,14 +1668,28 @@ struct HistoryView: View {
                 }
             } else {
                 List {
-                    ForEach(store.incidents) { incident in
-                        incidentRow(incident)
+                    if let insights, insights.total > 0 {
+                        Section {
+                            insightsCard(insights)
+                                .listRowBackground(Color.caneNavy)
+                                .listRowInsets(EdgeInsets())
+                        }
                     }
-                    .onDelete(perform: store.remove)
+                    Section {
+                        ForEach(store.incidents) { incident in
+                            incidentRow(incident)
+                        }
+                        .onDelete(perform: store.remove)
+                    }
                 }
                 .listStyle(.plain)
                 .scrollContentBackground(.hidden)
             }
+        }
+        // Re-run the Atlas aggregation whenever the log changes or the user
+        // signs in/out.
+        .task(id: "\(store.incidents.count)-\(auth.userId ?? "-")") {
+            await loadInsights()
         }
         .toolbar {
             ToolbarItem(placement: .navigationBarTrailing) {
@@ -1264,6 +1700,72 @@ struct HistoryView: View {
                 }
             }
         }
+    }
+
+    private func loadInsights() async {
+        guard let uid = auth.userId else {
+            insights = nil
+            return
+        }
+        // Two-way sync first, so incidents logged before sign-in get
+        // backfilled into Atlas and the aggregation counts match the list.
+        await store.pullFromAtlas(userId: uid)
+        insights = await store.fetchInsights(userId: uid)
+    }
+
+    private func insightsCard(_ insights: IncidentStore.Insights) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 6) {
+                Image(systemName: "chart.bar.fill")
+                    .foregroundColor(.caneBlue)
+                Text("INSIGHTS")
+                    .font(.caption.bold())
+                    .foregroundColor(.caneBlue)
+                Spacer()
+                Text("Live from Atlas")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundColor(Color(white: 0.45))
+            }
+
+            HStack(spacing: 10) {
+                statTile(value: insights.total, label: "Total", color: .caneBlue)
+                statTile(value: insights.highCount, label: "High", color: .red)
+                statTile(value: insights.mediumCount, label: "Medium", color: .orange)
+                statTile(value: insights.lowCount, label: "Low", color: Color(white: 0.55))
+            }
+
+            if let top = insights.topHazards.first {
+                HStack(spacing: 6) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.caption)
+                        .foregroundColor(.yellow)
+                    Text("Most common: \(top.type.replacingOccurrences(of: "_", with: " ").capitalized) (\(top.count)×)")
+                        .font(.caption)
+                        .foregroundColor(Color(white: 0.70))
+                }
+            }
+        }
+        .padding(16)
+        .background(Color.caneCard)
+        .cornerRadius(16)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Incident insights: \(insights.total) total, \(insights.highCount) high urgency, \(insights.mediumCount) medium, \(insights.lowCount) low")
+    }
+
+    private func statTile(value: Int, label: String, color: Color) -> some View {
+        VStack(spacing: 3) {
+            Text("\(value)")
+                .font(.title3.bold())
+                .monospacedDigit()
+                .foregroundColor(color)
+            Text(label)
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundColor(Color(white: 0.50))
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 8)
+        .background(Color.caneNavy.opacity(0.6))
+        .cornerRadius(10)
     }
 
     private func incidentRow(_ incident: Incident) -> some View {
