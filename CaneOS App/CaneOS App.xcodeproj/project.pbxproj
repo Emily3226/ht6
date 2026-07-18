@@ -8,6 +8,10 @@
 
 /* Begin PBXBuildFile section */
 		B720543B300B3E310082E536 /* CaneOS Watch App Watch App.app in Embed Watch Content */ = {isa = PBXBuildFile; fileRef = B7205431300B3E2F0082E536 /* CaneOS Watch App Watch App.app */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+		B7439ADD300BC218009EB9DC /* AtlasClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = B7439ADC300BC217009EB9DC /* AtlasClient.swift */; };
+		B7439ADF300BC228009EB9DC /* AuthManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = B7439ADE300BC228009EB9DC /* AuthManager.swift */; };
+		B7439AE1300BC228009EB9DC /* Auth0.plist in Resources */ = {isa = PBXBuildFile; fileRef = B7439AE0300BC228009EB9DC /* Auth0.plist */; };
+		B7439AE4300BC508009EB9DC /* Auth0 in Frameworks */ = {isa = PBXBuildFile; productRef = B7439AE3300BC508009EB9DC /* Auth0 */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -37,6 +41,9 @@
 /* Begin PBXFileReference section */
 		B720541F300B3ACF0082E536 /* CaneOS App.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "CaneOS App.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 		B7205431300B3E2F0082E536 /* CaneOS Watch App Watch App.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "CaneOS Watch App Watch App.app"; sourceTree = BUILT_PRODUCTS_DIR; };
+		B7439ADC300BC217009EB9DC /* AtlasClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AtlasClient.swift; sourceTree = "<group>"; };
+		B7439ADE300BC228009EB9DC /* AuthManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuthManager.swift; sourceTree = "<group>"; };
+		B7439AE0300BC228009EB9DC /* Auth0.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Auth0.plist; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -57,6 +64,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				B7439AE4300BC508009EB9DC /* Auth0 in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -76,6 +84,9 @@
 				B7205421300B3ACF0082E536 /* CaneOS App */,
 				B7205432300B3E2F0082E536 /* CaneOS Watch App Watch App */,
 				B7205420300B3ACF0082E536 /* Products */,
+				B7439ADC300BC217009EB9DC /* AtlasClient.swift */,
+				B7439ADE300BC228009EB9DC /* AuthManager.swift */,
+				B7439AE0300BC228009EB9DC /* Auth0.plist */,
 			);
 			sourceTree = "<group>";
 		};
@@ -110,6 +121,7 @@
 			);
 			name = "CaneOS App";
 			packageProductDependencies = (
+				B7439AE3300BC508009EB9DC /* Auth0 */,
 			);
 			productName = "CaneOS App";
 			productReference = B720541F300B3ACF0082E536 /* CaneOS App.app */;
@@ -164,6 +176,9 @@
 			);
 			mainGroup = B7205416300B3ACF0082E536;
 			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				B7439AE2300BC508009EB9DC /* XCRemoteSwiftPackageReference "Auth0" */,
+			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = B7205420300B3ACF0082E536 /* Products */;
 			projectDirPath = "";
@@ -180,6 +195,7 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				B7439AE1300BC228009EB9DC /* Auth0.plist in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -197,6 +213,8 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				B7439ADD300BC218009EB9DC /* AtlasClient.swift in Sources */,
+				B7439ADF300BC228009EB9DC /* AuthManager.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -347,6 +365,7 @@
 				DEVELOPMENT_TEAM = LKHXM8HNZC;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = "CaneOS-App-Info.plist";
 				INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = "CaneOS uses your location to include it in the emergency SOS alert sent to your contacts.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
@@ -380,6 +399,7 @@
 				DEVELOPMENT_TEAM = LKHXM8HNZC;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = "CaneOS-App-Info.plist";
 				INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = "CaneOS uses your location to include it in the emergency SOS alert sent to your contacts.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
@@ -500,6 +520,25 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		B7439AE2300BC508009EB9DC /* XCRemoteSwiftPackageReference "Auth0" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/auth0/Auth0.swift";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 3.0.0;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		B7439AE3300BC508009EB9DC /* Auth0 */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = B7439AE2300BC508009EB9DC /* XCRemoteSwiftPackageReference "Auth0" */;
+			productName = Auth0;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = B7205417300B3ACF0082E536 /* Project object */;
 }

@@ -52,6 +52,7 @@ struct ContentView: View {
     @StateObject private var contactsManager = EmergencyContactsManager.shared
     @StateObject private var settings        = AppSettings.shared
     @StateObject private var incidents       = IncidentStore.shared
+    @StateObject private var auth            = AuthManager.shared
 
     // Two independent sockets, matching the backend's split:
     // /ws/haptics -- immediate, unthrottled, 3-value direction only.
@@ -99,7 +100,7 @@ struct ContentView: View {
             .tabItem { Label("Home", systemImage: "house.fill") }
 
             NavigationStack {
-                SettingsView(settings: settings)
+                SettingsView(settings: settings, auth: auth)
                     .navigationTitle("Settings")
             }
             .tabItem { Label("Settings", systemImage: "slider.horizontal.3") }
@@ -425,6 +426,7 @@ struct HomeView: View {
 
 struct SettingsView: View {
     @ObservedObject var settings: AppSettings
+    @ObservedObject var auth: AuthManager
 
     var body: some View {
         ZStack {
@@ -479,6 +481,80 @@ struct SettingsView: View {
                     .accessibilityHint("Toggles spoken descriptions for detected obstacles")
                 } header: {
                     sectionHeader(icon: "speaker.wave.2.fill", title: "Audio")
+                }
+
+                // MARK: Account (Auth0 + Atlas sync)
+                Section {
+                    if auth.isAuthenticated {
+                        VStack(alignment: .leading, spacing: 5) {
+                            if let name = auth.userName {
+                                Text(name)
+                                    .font(.body.weight(.semibold))
+                                    .foregroundColor(.white)
+                            }
+                            if let email = auth.userEmail {
+                                Text(email)
+                                    .font(.caption)
+                                    .foregroundColor(Color(white: 0.55))
+                            }
+                        }
+                        .padding(.vertical, 2)
+                        .listRowBackground(Color.caneCard)
+
+                        Button {
+                            Task { await auth.syncToCloud() }
+                        } label: {
+                            HStack(spacing: 8) {
+                                if auth.isSyncing {
+                                    ProgressView().tint(.caneBlue)
+                                } else {
+                                    Image(systemName: "arrow.triangle.2.circlepath")
+                                        .foregroundColor(.caneBlue)
+                                }
+                                Text(auth.isSyncing ? "Syncing…" : "Sync now")
+                                    .foregroundColor(.white)
+                            }
+                        }
+                        .disabled(auth.isSyncing)
+                        .listRowBackground(Color.caneCard)
+                        .accessibilityLabel("Sync contacts and settings to cloud")
+
+                        Button(role: .destructive) {
+                            Task { await auth.logout() }
+                        } label: {
+                            Text("Sign Out")
+                                .frame(maxWidth: .infinity, alignment: .center)
+                                .font(.body.weight(.semibold))
+                        }
+                        .listRowBackground(Color.caneCard)
+                    } else {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Sign in to sync your contacts and settings across devices.")
+                                .font(.caption)
+                                .foregroundColor(Color(white: 0.55))
+                        }
+                        .listRowBackground(Color.caneCard)
+
+                        Button {
+                            Task { await auth.login() }
+                        } label: {
+                            HStack {
+                                Spacer()
+                                if auth.isSyncing {
+                                    ProgressView().tint(.white)
+                                }
+                                Text(auth.isSyncing ? "Signing in…" : "Sign in with Auth0")
+                                    .font(.body.weight(.semibold))
+                                    .foregroundColor(.white)
+                                Spacer()
+                            }
+                        }
+                        .disabled(auth.isSyncing)
+                        .listRowBackground(auth.isSyncing ? Color(white: 0.18) : Color.caneBlue)
+                        .accessibilityLabel("Sign in with Auth0")
+                    }
+                } header: {
+                    sectionHeader(icon: "person.crop.circle.fill", title: "Account")
                 }
             }
             .listStyle(.plain)
