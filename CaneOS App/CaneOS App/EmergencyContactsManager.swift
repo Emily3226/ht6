@@ -1,6 +1,4 @@
 import Foundation
-import SwiftUI
-import Combine
 
 enum ContactPriority: String, Codable {
     case primary, secondary, none
@@ -34,10 +32,12 @@ struct EmergencyContact: Identifiable, Codable {
 }
 
 final class EmergencyContactsManager: ObservableObject {
+    static let shared = EmergencyContactsManager()
+
     @Published var contacts: [EmergencyContact] = []
     private let storageKey = "emergencyContacts"
 
-    init() { load() }
+    private init() { load() }
 
     /// Primary first, secondary second, then the rest sorted A–Z.
     var sortedContacts: [EmergencyContact] {
