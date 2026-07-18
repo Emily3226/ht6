@@ -232,9 +232,8 @@ struct ContentView: View {
             try await sosManager.sendEmergencyAlert(
                 to: contactsManager.contacts,
                 location: location,
-                accountSid: Config.twilioAccountSid,
-                authToken: Config.twilioAuthToken,
-                fromNumber: Config.twilioFromNumber
+                resendAPIKey: Config.resendAPIKey,
+                fromEmail: Config.resendFromEmail
             )
         } catch {
             sosErrorMessage = error.localizedDescription
@@ -471,6 +470,7 @@ struct SafetyView: View {
 
     @State private var newName  = ""
     @State private var newPhone = ""
+    @State private var newCarrier: Carrier = .bell
     @GestureState private var isPressing = false
     @State private var holdProgress: Double = 0
     @State private var holdTimer: Timer?
@@ -564,6 +564,20 @@ struct SafetyView: View {
                     .keyboardType(.phonePad)
                     .accessibilityLabel("New contact phone number")
 
+                Picker("Carrier", selection: $newCarrier) {
+                    ForEach(Carrier.allCases) { carrier in
+                        Text(carrier.displayName).tag(carrier)
+                    }
+                }
+                .pickerStyle(.menu)
+                .tint(.white)
+                .padding(12)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color.caneCard)
+                .cornerRadius(10)
+                .accessibilityLabel("New contact's mobile carrier")
+                .accessibilityHint("Needed so SOS alerts can be delivered as a text message")
+
                 Button(action: addContact) {
                     Label("Add Contact", systemImage: "plus.circle.fill")
                         .frame(maxWidth: .infinity)
@@ -603,6 +617,9 @@ struct SafetyView: View {
                 Text(contact.phoneNumber)
                     .font(.subheadline)
                     .foregroundColor(Color(white: 0.55))
+                Text(contact.carrier.displayName)
+                    .font(.caption)
+                    .foregroundColor(Color(white: 0.40))
             }
             Spacer()
             Button(role: .destructive) {
@@ -625,8 +642,8 @@ struct SafetyView: View {
 
     private func addContact() {
         guard !newName.isEmpty, !newPhone.isEmpty else { return }
-        contactsManager.add(name: newName, phoneNumber: newPhone)
-        newName = ""; newPhone = ""
+        contactsManager.add(name: newName, phoneNumber: newPhone, carrier: newCarrier)
+        newName = ""; newPhone = ""; newCarrier = .bell
     }
 
     private func startHold() {

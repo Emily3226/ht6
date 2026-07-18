@@ -1,33 +1,70 @@
 import Foundation
 
-enum ContactPriority: String, Codable {
-    case primary, secondary, none
+/// Mobile carrier, used to build an email-to-SMS gateway address
+/// (e.g. "6135551234@txt.bell.ca"). We route SOS alerts through the
+/// carrier's email gateway instead of a direct SMS API (see SOSManager),
+/// so we need to know each contact's carrier to build the right address.
+enum Carrier: String, Codable, CaseIterable, Identifiable {
+    // Canadian carriers
+    case bell, telus, rogers, fido, koodo, virginPlus, freedom, videotron
+    // US carriers (in case a contact is in the US)
+    case verizon, att, tmobile, sprint
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .bell:       return "Bell"
+        case .telus:      return "Telus"
+        case .rogers:     return "Rogers"
+        case .fido:       return "Fido"
+        case .koodo:      return "Koodo"
+        case .virginPlus: return "Virgin Plus"
+        case .freedom:    return "Freedom Mobile"
+        case .videotron:  return "Vidéotron"
+        case .verizon:    return "Verizon (US)"
+        case .att:        return "AT&T (US)"
+        case .tmobile:    return "T-Mobile (US)"
+        case .sprint:     return "Sprint (US)"
+        }
+    }
+
+    /// The email-to-SMS gateway domain for this carrier. Sending an email to
+    /// "[10-digit number]@[this domain]" gets delivered as a text message.
+    var gatewayDomain: String {
+        switch self {
+        case .bell:       return "txt.bell.ca"
+        case .telus:      return "msg.telus.com"
+        case .rogers:     return "pcs.rogers.com"
+        case .fido:       return "fido.ca"
+        case .koodo:      return "msg.koodomobile.com"
+        case .virginPlus: return "vmobile.ca"
+        case .freedom:    return "txt.freedommobile.ca"
+        case .videotron:  return "videotron.ca"
+        case .verizon:    return "vtext.com"
+        case .att:        return "txt.att.net"
+        case .tmobile:    return "tmomail.net"
+        case .sprint:     return "messaging.sprintpcs.com"
+        }
+    }
 }
 
 struct EmergencyContact: Identifiable, Codable {
     let id: UUID
     var name: String
     var phoneNumber: String
-    var priority: ContactPriority
+    var carrier: Carrier
 
-    enum CodingKeys: String, CodingKey {
-        case id, name, phoneNumber, priority
-    }
-
-    init(id: UUID, name: String, phoneNumber: String, priority: ContactPriority = .none) {
-        self.id = id
-        self.name = name
-        self.phoneNumber = phoneNumber
-        self.priority = priority
-    }
-
-    // Graceful fallback for contacts saved before priority was added
-    init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        id          = try c.decode(UUID.self, forKey: .id)
-        name        = try c.decode(String.self, forKey: .name)
-        phoneNumber = try c.decode(String.self, forKey: .phoneNumber)
-        priority    = try c.decodeIfPresent(ContactPriority.self, forKey: .priority) ?? .none
+    /// The email address that, when sent an email, gets delivered to this
+    /// contact's phone as a text message via their carrier's SMS gateway.
+    var smsGatewayAddress: String {
+        let digitsOnly = phoneNumber.filter(\.isNumber)
+        // Most gateways expect the bare 10-digit number, without a leading
+        // country code -- strip a leading "1" if present (e.g. from +1...).
+        let localDigits = (digitsOnly.count == 11 && digitsOnly.hasPrefix("1"))
+            ? String(digitsOnly.dropFirst())
+            : digitsOnly
+        return "\(localDigits)@\(carrier.gatewayDomain)"
     }
 }
 
@@ -39,40 +76,13 @@ final class EmergencyContactsManager: ObservableObject {
 
     private init() { load() }
 
-    /// Primary first, secondary second, then the rest sorted A–Z.
-    var sortedContacts: [EmergencyContact] {
-        let primary   = contacts.filter { $0.priority == .primary }
-        let secondary = contacts.filter { $0.priority == .secondary }
-        let rest      = contacts.filter { $0.priority == .none }
-                                .sorted { $0.name.localizedCompare($1.name) == .orderedAscending }
-        return primary + secondary + rest
-    }
-
-    func add(name: String, phoneNumber: String, priority: ContactPriority = .none) {
-        if priority != .none {
-            for i in contacts.indices where contacts[i].priority == priority {
-                contacts[i].priority = .none
-            }
-        }
-        contacts.append(EmergencyContact(id: UUID(), name: name, phoneNumber: phoneNumber, priority: priority))
+    func add(name: String, phoneNumber: String, carrier: Carrier) {
+        contacts.append(EmergencyContact(id: UUID(), name: name, phoneNumber: phoneNumber, carrier: carrier))
         save()
     }
 
     func remove(at offsets: IndexSet) {
         contacts.remove(atOffsets: offsets)
-        save()
-    }
-
-    /// Assign a priority to one contact; any existing holder of that priority is demoted to none.
-    func setPriority(_ priority: ContactPriority, for id: UUID) {
-        if priority != .none {
-            for i in contacts.indices where contacts[i].priority == priority {
-                contacts[i].priority = .none
-            }
-        }
-        if let i = contacts.firstIndex(where: { $0.id == id }) {
-            contacts[i].priority = priority
-        }
         save()
     }
 

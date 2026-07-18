@@ -14,10 +14,7 @@ final class SOSManager: NSObject, CLLocationManagerDelegate {
 
     /// Fetches the current location, first waiting for the user to actually
     /// respond to the permission dialog if authorization hasn't been decided
-    /// yet. Previously this fired `requestLocation()` immediately after
-    /// `requestWhenInUseAuthorization()`, which raced the system prompt --
-    /// on a fresh install the location request would fail instantly with
-    /// "not authorized" before the person had a chance to tap Allow.
+    /// yet, rather than racing `requestLocation()` against the system prompt.
     func requestLocation() async throws -> CLLocation {
         let status = locationManager.authorizationStatus
 
@@ -62,17 +59,21 @@ final class SOSManager: NSObject, CLLocationManagerDelegate {
         locationContinuation = nil
     }
 
-    // Sends via Twilio so this fires automatically -- MFMessageComposeViewController
-    // requires the user to tap "Send" themselves, which defeats the point of an SOS.
+    /// Sends the SOS alert automatically (no user interaction) by emailing
+    /// each contact's carrier SMS gateway address -- e.g.
+    /// "6135551234@txt.bell.ca" -- which the carrier delivers as a text.
+    /// This sidesteps needing a full SMS-provider account (Twilio etc.),
+    /// whose trial tiers require pre-verifying every recipient number,
+    /// which defeats the point of an SOS that must reach *any* contact
+    /// a user adds. We only need an easy-to-get transactional email API key.
     func sendEmergencyAlert(
         to contacts: [EmergencyContact],
         location: CLLocation,
-        accountSid: String,
-        authToken: String,
-        fromNumber: String
+        resendAPIKey: String,
+        fromEmail: String
     ) async throws {
-        guard !accountSid.isEmpty, !authToken.isEmpty, !fromNumber.isEmpty else {
-            throw SOSError.missingTwilioCredentials
+        guard !resendAPIKey.isEmpty, !fromEmail.isEmpty else {
+            throw SOSError.missingEmailCredentials
         }
         guard !contacts.isEmpty else {
             throw SOSError.noEmergencyContacts
@@ -84,12 +85,11 @@ final class SOSManager: NSObject, CLLocationManagerDelegate {
         try await withThrowingTaskGroup(of: Void.self) { group in
             for contact in contacts {
                 group.addTask {
-                    try await self.sendTwilioSMS(
-                        to: contact.phoneNumber,
+                    try await self.sendGatewayEmail(
+                        to: contact.smsGatewayAddress,
                         body: message,
-                        accountSid: accountSid,
-                        authToken: authToken,
-                        fromNumber: fromNumber
+                        resendAPIKey: resendAPIKey,
+                        fromEmail: fromEmail
                     )
                 }
             }
@@ -97,48 +97,50 @@ final class SOSManager: NSObject, CLLocationManagerDelegate {
         }
     }
 
-    private func sendTwilioSMS(
-        to: String, body: String,
-        accountSid: String, authToken: String, fromNumber: String
+    private func sendGatewayEmail(
+        to: String, body: String, resendAPIKey: String, fromEmail: String
     ) async throws {
-        let url = URL(string: "https://api.twilio.com/2010-04-01/Accounts/\(accountSid)/Messages.json")!
+        let url = URL(string: "https://api.resend.com/emails")!
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
+        request.setValue("Bearer \(resendAPIKey)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
-        let credentials = "\(accountSid):\(authToken)".data(using: .utf8)!.base64EncodedString()
-        request.setValue("Basic \(credentials)", forHTTPHeaderField: "Authorization")
-        request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
-
-        func encode(_ s: String) -> String {
-            s.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? s
-        }
-        let bodyString = "To=\(encode(to))&From=\(encode(fromNumber))&Body=\(encode(body))"
-        request.httpBody = bodyString.data(using: .utf8)
+        // Carrier SMS gateways generally render the email's plain-text body
+        // (and often ignore/strip the subject), so keep this minimal --
+        // no HTML, no signature, just the alert text.
+        let payload: [String: Any] = [
+            "from": fromEmail,
+            "to": [to],
+            "subject": "SOS",
+            "text": body
+        ]
+        request.httpBody = try JSONSerialization.data(withJSONObject: payload)
 
         let (data, response) = try await URLSession.shared.data(for: request)
         if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
             let bodyText = String(data: data, encoding: .utf8) ?? "unknown error"
-            throw SOSError.twilioRequestFailed(status: http.statusCode, message: bodyText)
+            throw SOSError.emailRequestFailed(status: http.statusCode, message: bodyText)
         }
     }
 }
 
 enum SOSError: LocalizedError {
     case locationPermissionDenied
-    case missingTwilioCredentials
+    case missingEmailCredentials
     case noEmergencyContacts
-    case twilioRequestFailed(status: Int, message: String)
+    case emailRequestFailed(status: Int, message: String)
 
     var errorDescription: String? {
         switch self {
         case .locationPermissionDenied:
             return "Location access is off, so we can't include your position in the SOS message. Enable it in Settings > Privacy > Location Services."
-        case .missingTwilioCredentials:
-            return "SOS texting isn't configured yet -- add your Twilio credentials in Config.swift."
+        case .missingEmailCredentials:
+            return "SOS alerts aren't configured yet -- add your Resend API key and from-address in Config.swift."
         case .noEmergencyContacts:
-            return "No emergency contacts are saved. Add at least one in the Safety tab."
-        case .twilioRequestFailed(let status, let message):
-            return "Twilio couldn't send the SOS message (status \(status)): \(message)"
+            return "No emergency contacts are saved. Add at least one, with their carrier, in the Safety tab."
+        case .emailRequestFailed(let status, let message):
+            return "Couldn't send the SOS alert (status \(status)): \(message)"
         }
     }
 }
