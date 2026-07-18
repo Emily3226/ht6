@@ -182,6 +182,10 @@ final class EmergencyContactsManager: ObservableObject {
         Task {
             try? await BackendClient.shared.syncContacts(contactsSnapshot)
         }
+        Task { @MainActor in
+            guard let uid = AuthManager.shared.userId else { return }
+            await pushToAtlas(userId: uid)
+        }
     }
 
     private func load() {
@@ -189,5 +193,60 @@ final class EmergencyContactsManager: ObservableObject {
            let saved = try? JSONDecoder().decode([EmergencyContact].self, from: data) {
             contacts = saved
         }
+    }
+
+    // MARK: - Atlas sync (per-user, Auth0-scoped; used by AuthManager's
+    // cross-device sync on login/restore)
+
+    @MainActor
+    func pushToAtlas(userId: String) async {
+        do {
+            try await AtlasClient.shared.deleteMany(collection: "contacts",
+                                                     filter: ["userId": userId])
+            let docs = contacts.map { $0.atlasDoc(userId: userId) }
+            try await AtlasClient.shared.insertMany(collection: "contacts", documents: docs)
+        } catch {
+            print("[Atlas] pushContacts error: \(error.localizedDescription)")
+        }
+    }
+
+    @MainActor
+    func pullFromAtlas(userId: String) async {
+        do {
+            let docs = try await AtlasClient.shared.find(collection: "contacts",
+                                                          filter: ["userId": userId])
+            let fetched = docs.compactMap { EmergencyContact(atlasDoc: $0) }
+            if fetched.isEmpty {
+                await pushToAtlas(userId: userId)
+            } else {
+                contacts = fetched
+                if let data = try? JSONEncoder().encode(contacts) {
+                    UserDefaults.standard.set(data, forKey: storageKey)
+                }
+            }
+        } catch {
+            print("[Atlas] pullContacts error: \(error.localizedDescription)")
+        }
+    }
+}
+
+// MARK: - Atlas serialization
+
+extension EmergencyContact {
+    func atlasDoc(userId: String) -> [String: Any] {
+        ["userId": userId, "id": id.uuidString,
+         "name": name, "phoneNumber": phoneNumber,
+         "carrier": carrier.rawValue,
+         "priority": priority.rawValue]
+    }
+
+    init?(atlasDoc doc: [String: Any]) {
+        guard let idStr = doc["id"] as? String,
+              let id    = UUID(uuidString: idStr),
+              let name  = doc["name"] as? String,
+              let phone = doc["phoneNumber"] as? String else { return nil }
+        let carrier  = Carrier(rawValue: doc["carrier"] as? String ?? "") ?? .bell
+        let priority = ContactPriority(rawValue: doc["priority"] as? String ?? "") ?? .none
+        self.init(id: id, name: name, phoneNumber: phone, carrier: carrier, priority: priority)
     }
 }

@@ -240,6 +240,59 @@ async def simulate_tof(direction: str) -> dict:
     return {"ok": True, "direction": direction, "object_class": object_class}
 
 
+# ---------------------------------------------------------------------------
+# SOS relay: sends real iMessage/SMS with zero user interaction by driving
+# the Mac's Messages.app via AppleScript. iOS forbids apps from sending SMS
+# silently, but macOS Messages is scriptable — and this server already runs
+# on the Mac, so the phone just asks us to send. Recipients with iPhones get
+# iMessage instantly; enabling Text Message Forwarding on the paired iPhone
+# extends this to true SMS for non-iMessage numbers. macOS-only by nature.
+# ---------------------------------------------------------------------------
+
+import subprocess as _subprocess
+import sys as _sys
+
+_SEND_SCRIPT = (
+    'on run {target, msg}\n'
+    'tell application "Messages"\n'
+    'send msg to participant target\n'
+    'end tell\n'
+    'end run'
+)
+
+
+def _send_via_messages_app(recipient: str, message: str):
+    proc = _subprocess.run(
+        ["osascript", "-e", _SEND_SCRIPT, recipient, message],
+        capture_output=True, text=True, timeout=20,
+    )
+    err = proc.stderr.strip()
+    return (proc.returncode == 0 and not err), (err or None)
+
+
+@app.post("/sos")
+async def sos_relay(payload: dict) -> dict:
+    if _sys.platform != "darwin":
+        raise HTTPException(status_code=501, detail="Messages relay only works on macOS")
+    recipients = payload.get("recipients") or []
+    message = payload.get("message") or ""
+    if not recipients or not message:
+        raise HTTPException(status_code=400, detail="recipients and message are required")
+
+    results = []
+    for recipient in recipients:
+        try:
+            ok, err = await asyncio.to_thread(_send_via_messages_app, recipient, message)
+        except Exception as exc:  # noqa: BLE001 - report, don't crash the endpoint
+            ok, err = False, str(exc)
+        results.append({"to": recipient, "ok": ok, "error": err})
+        logger.info("SOS relay to %s: %s%s", recipient, "sent" if ok else "FAILED",
+                    f" ({err})" if err else "")
+
+    sent = sum(1 for r in results if r["ok"])
+    return {"sent": sent, "results": results}
+
+
 def get_local_ip() -> str:
     """
     Best-effort discovery of this machine's LAN IP (not 127.0.0.1), since
