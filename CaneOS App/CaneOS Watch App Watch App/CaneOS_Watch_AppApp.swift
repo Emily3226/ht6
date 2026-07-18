@@ -10,8 +10,11 @@ import SwiftUI
 @main
 struct CaneOS_Watch_App_Watch_AppApp: App {
     var body: some Scene {
-        WindowGroup {
-            ContentView()
+        WindowGroup { 
+            WatchConnectionTestView()
+
+        //WindowGroup {
+        //    ContentView()
         }
     }
 }
