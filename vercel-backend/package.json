@@ -1,0 +1,10 @@
+{
+  "name": "caneos-vercel-backend",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Serverless proxy: holds Mongo + Resend credentials server-side so the Swift app never ships them.",
+  "dependencies": {
+    "mongodb": "^6.9.0",
+    "resend": "^4.0.0"
+  }
+}

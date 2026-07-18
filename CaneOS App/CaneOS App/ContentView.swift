@@ -230,9 +230,7 @@ struct ContentView: View {
 
             try await sosManager.sendEmergencyAlert(
                 to: contactsManager.contacts,
-                location: location,
-                resendAPIKey: Config.resendAPIKey,
-                fromEmail: Config.resendFromEmail
+                location: location
             )
         } catch {
             sosErrorMessage = error.localizedDescription
