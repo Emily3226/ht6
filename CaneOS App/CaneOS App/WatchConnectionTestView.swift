@@ -36,7 +36,6 @@ struct WatchConnectionTestView: View {
                     HStack(spacing: 12) {
                         directionButton(.left)
                         directionButton(.up)
-                        directionButton(.down)
                         directionButton(.right)
                     }
                 }
@@ -84,7 +83,7 @@ struct WatchConnectionTestView: View {
         }
     }
 
-    private func directionButton(_ direction: PhoneSessionManager.HapticDirection) -> some View {
+    private func directionButton(_ direction: HapticSensorDirection) -> some View {
         Button {
             phoneSession.sendHaptic(direction)
             sentCount += 1

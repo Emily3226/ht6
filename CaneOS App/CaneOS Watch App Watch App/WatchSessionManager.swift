@@ -103,9 +103,9 @@ final class WatchSessionManager: NSObject, ObservableObject, WCSessionDelegate {
         case "up":
             device.play(.notification)
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { device.play(.notification) }
-        case "down":
-            device.play(.failure)
         default:
+            // /ws/haptics only ever sends left/right/up -- anything else here
+            // means a malformed message got through, not a valid 4th sensor.
             if intensity != "low" { device.play(.click) }
         }
     }

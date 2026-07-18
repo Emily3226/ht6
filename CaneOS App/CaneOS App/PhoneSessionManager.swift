@@ -18,18 +18,16 @@ final class PhoneSessionManager: NSObject, ObservableObject, WCSessionDelegate {
 
     // Apple Watch has no true spatial haptics, so "direction" maps to a
     // preset haptic type + timing pattern on the Watch side, not a real buzz location.
-    enum HapticDirection: String {
-        case left, right, up, down
-
-        var message: [String: Any] { ["direction": rawValue] }
-    }
-
-    func sendHaptic(_ direction: HapticDirection) {
+    // Uses HapticSensorDirection (defined in CaneMessage.swift) directly --
+    // it already mirrors /ws/haptics exactly (3 physical sensors, 3 possible
+    // values), so there's no separate phone-side direction type to keep in sync.
+    func sendHaptic(_ direction: HapticSensorDirection) {
+        let message: [String: Any] = ["direction": direction.rawValue]
         guard WCSession.default.isReachable else {
-            WCSession.default.transferUserInfo(direction.message)
+            WCSession.default.transferUserInfo(message)
             return
         }
-        WCSession.default.sendMessage(direction.message, replyHandler: nil) { error in
+        WCSession.default.sendMessage(message, replyHandler: nil) { error in
             print("Haptic send failed: \(error.localizedDescription)")
         }
     }

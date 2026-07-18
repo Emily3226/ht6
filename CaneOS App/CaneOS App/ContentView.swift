@@ -53,9 +53,13 @@ struct ContentView: View {
     @StateObject private var settings        = AppSettings.shared
     @StateObject private var incidents       = IncidentStore.shared
 
-    @State private var caneConnection      = CaneConnection()
+    // Two independent sockets, matching the backend's split:
+    // /ws/haptics -- immediate, unthrottled, 3-value direction only.
+    // /ws/hazards -- richer, throttled by the backend, drives audio/UI.
+    @State private var hapticsConnection   = CaneSocketConnection<HapticMessage>()
+    @State private var hazardsConnection   = CaneSocketConnection<CaneHazardChannelEvent>()
     @State private var sosManager          = SOSManager()
-    @State private var lastHazard: CaneMessage?
+    @State private var lastHazard: HazardMessage?
     @State private var isScanning          = false
     @State private var isHardwareConnected = false
     @State private var sosCountdown: Int?  = nil
@@ -137,34 +141,41 @@ struct ContentView: View {
     // MARK: - Backend wiring
 
     private func connectToBackend() {
-        caneConnection.onConnectionChange = { connected in
+        // /ws/haptics: immediate, unthrottled. The handler does exactly one
+        // thing -- forward the buzz -- with nothing else on the path (no
+        // logging, no async work, no awaiting) so nothing here adds latency
+        // between the sensor firing on the backend and the Watch buzzing.
+        hapticsConnection.onMessage = { message in
+            phoneSession.sendHaptic(message.direction)
+        }
+        hapticsConnection.connect(to: Config.hapticsWebSocketURL)
+
+        // /ws/hazards: richer, backend-throttled. Drives the UI, TTS, SOS,
+        // and incident history.
+        hazardsConnection.onConnectionChange = { connected in
             isHardwareConnected = connected
         }
-        caneConnection.onMessage = { message in
+        hazardsConnection.onMessage = { event in
             Task { @MainActor in
-                switch message.type {
-                case "hazard":            handleHazard(message)
-                case "scene_description": await handleSceneDescription(message)
-                default: break
+                switch event {
+                case .hazard(let hazard):
+                    handleHazard(hazard)
+                case .sceneDescription(let text):
+                    await handleSceneDescription(text)
                 }
             }
         }
-        caneConnection.connect(to: Config.backendWebSocketURL)
+        hazardsConnection.connect(to: Config.hazardsWebSocketURL)
     }
 
-    private func handleHazard(_ hazard: CaneMessage) {
+    private func handleHazard(_ hazard: HazardMessage) {
         lastHazard = hazard
         isScanning = false
         let incidentId = incidents.log(
-            hazardType: hazard.hazardType ?? "unknown",
-            direction:  hazard.direction  ?? "-",
-            urgency:    hazard.urgency    ?? "-"
+            hazardType: hazard.hazardType,
+            direction:  hazard.direction.rawValue,
+            urgency:    hazard.urgency
         )
-
-        if let dir = hazard.direction,
-           let hDir = PhoneSessionManager.HapticDirection(rawValue: dir) {
-            phoneSession.sendHaptic(hDir)
-        }
 
         if hazard.urgency == "high" {
             // High-urgency hazards trigger the SOS flow, which fetches location
@@ -182,7 +193,8 @@ struct ContentView: View {
             }
         }
 
-        guard settings.audioEnabled, let desc = hazard.spokenDescription else { return }
+        guard settings.audioEnabled else { return }
+        let desc = hazard.spokenDescription
 
         if hazard.urgency == "high" {
             // TTS and SOS fire in parallel — UI countdown runs concurrently with audio
@@ -242,12 +254,11 @@ struct ContentView: View {
 
     private func requestSceneDescription() {
         isScanning = true
-        caneConnection.sendCommand("scan_now")
+        hazardsConnection.sendCommand("scan_now")
     }
 
-    private func handleSceneDescription(_ message: CaneMessage) async {
+    private func handleSceneDescription(_ text: String) async {
         isScanning = false
-        guard let text = message.text else { return }
         do {
             let reply = try await backboard.send(text: text)
             await speakAndPlay(reply)
@@ -271,7 +282,7 @@ struct ContentView: View {
 struct HomeView: View {
     let isConnected: Bool
     let isWatchConnected: Bool
-    let lastHazard: CaneMessage?
+    let lastHazard: HazardMessage?
     let isScanning: Bool
     let onScan: () -> Void
     let onRefresh: () async -> Void
@@ -352,7 +363,7 @@ struct HomeView: View {
             : "Apple Watch not reachable")
     }
 
-    private func lastAlertCard(_ hazard: CaneMessage) -> some View {
+    private func lastAlertCard(_ hazard: HazardMessage) -> some View {
         HStack(spacing: 14) {
             Image(systemName: "exclamationmark.triangle.fill")
                 .foregroundColor(.yellow)
@@ -362,10 +373,10 @@ struct HomeView: View {
                     .font(.caption)
                     .foregroundColor(Color(white: 0.50))
                     .textCase(.uppercase)
-                Text(hazard.hazardType?.capitalized ?? "Hazard")
+                Text(hazard.hazardType.capitalized)
                     .font(.headline)
                     .foregroundColor(.white)
-                Text("\(hazard.direction ?? "-") · \(hazard.urgency ?? "-") urgency")
+                Text("\(hazard.direction.rawValue) · \(hazard.urgency) urgency")
                     .font(.subheadline)
                     .foregroundColor(Color(white: 0.60))
             }
@@ -375,7 +386,7 @@ struct HomeView: View {
         .background(Color.caneCard)
         .cornerRadius(16)
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("Last alert: \(hazard.hazardType ?? "hazard"), \(hazard.direction ?? "unknown direction"), \(hazard.urgency ?? "unknown") urgency")
+        .accessibilityLabel("Last alert: \(hazard.hazardType), \(hazard.direction.rawValue), \(hazard.urgency) urgency")
     }
 
     private var scanButton: some View {
