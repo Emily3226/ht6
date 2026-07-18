@@ -162,6 +162,35 @@ async def broadcast_haptic(direction: str) -> None:
     await haptic_manager.broadcast({"direction": direction})
 
 
+# ---------------------------------------------------------------------------
+# Camera status path: independent of hazards and haptics. Own connection
+# manager, own endpoint. Broadcasts only on state transitions -- see
+# camera_watchdog.py for why (it only ever returns an event on an actual
+# change, never on steady state).
+# ---------------------------------------------------------------------------
+
+status_manager = ConnectionManager()
+
+
+@app.websocket("/ws/status")
+async def ws_status(websocket: WebSocket) -> None:
+    await status_manager.connect(websocket)
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        status_manager.disconnect(websocket)
+
+
+async def broadcast_status(event: str, timestamp: float) -> None:
+    """
+    Called by status_loop.py whenever CameraWatchdog reports a state
+    transition. Sends exactly {"event": ..., "timestamp": ...} -- nothing
+    else -- to every connected Swift client.
+    """
+    await status_manager.broadcast({"event": event, "timestamp": timestamp})
+
+
 def get_local_ip() -> str:
     """
     Best-effort discovery of this machine's LAN IP (not 127.0.0.1), since

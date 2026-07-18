@@ -1,6 +1,6 @@
 # Cane hazard pipeline
 
-Three independent background tasks, all wired up in `pipeline/main.py`:
+Four independent background tasks, all wired up in `pipeline/main.py`:
 
 - **Camera detection path** (`run_pipeline`): camera detection -> ToF
   distance lookup -> filter -> pushes onto a shared narration queue.
@@ -12,6 +12,10 @@ Three independent background tasks, all wired up in `pipeline/main.py`:
   the above meet -- pulls queued events, throttles, produces a spoken
   description (via Gemini for camera events, via a template for overhead
   ones), and broadcasts the result over `/ws/hazards`.
+- **Camera status loop** (`run_status_loop`, added 2026-07-18): consumes a
+  periodic camera heartbeat and broadcasts online/offline transitions over
+  `/ws/status`, completely independent of the three paths above (see
+  "Camera health monitoring" below).
 
 Pipeline stages (see `pipeline/`):
 
@@ -45,9 +49,20 @@ Pipeline stages (see `pipeline/`):
    reflex path; never imports `throttle.py` or `gemini_stage.py` (the
    narration_queue push for "up" triggers is fire-and-forget and adds no
    dependency on either).
-10. **server.py** -- FastAPI app: `GET /health`, `WS /ws/hazards`, and
-    `WS /ws/haptics`, each with their own connection manager.
-11. **main.py** -- wires all three background tasks together.
+10. **server.py** -- FastAPI app: `GET /health`, `WS /ws/hazards`,
+    `WS /ws/haptics`, and `WS /ws/status`, each with their own connection
+    manager.
+11. **heartbeat_input.py** -- mock periodic camera heartbeat, independent
+    of detection events; the integration point for the real hardware
+    heartbeat feed.
+12. **camera_watchdog.py** -- `CameraWatchdog`: turns heartbeat activity
+    (or silence) into online/offline transitions, firing an event only
+    when the state actually changes.
+13. **status_loop.py** -- consumes the heartbeat stream and independently
+    polls for timeout, both driving one `CameraWatchdog`; never imports
+    `throttle.py`, `gemini_stage.py`, `narration_queue.py`, `haptic_loop.py`,
+    or `haptic_arbiter.py`.
+14. **main.py** -- wires all four background tasks together.
 
 ## macOS / Linux setup
 
@@ -189,6 +204,75 @@ field can now be `"up"` in addition to `"left" | "center" | "right"`. This
 is intentional, not a bug -- overhead hazards are a real, distinct
 narration case. Whatever decodes `/ws/hazards` messages needs to accept a
 fourth `direction` value.
+
+## Camera health monitoring (`/ws/status`)
+
+Without this, "camera saw nothing hazardous" and "camera pipeline crashed"
+look identical downstream -- both just mean no hazard messages arrive. To
+tell them apart, the camera process is expected to push a periodic
+heartbeat, independent of whatever it does or doesn't detect:
+
+```json
+{"status": "ok", "timestamp": 1700000000}
+```
+
+or, if it can detect its own failure:
+
+```json
+{"status": "error", "detail": "...", "timestamp": 1700000000}
+```
+
+`camera_watchdog.CameraWatchdog` turns that (or its absence) into
+online/offline state, and `/ws/status` broadcasts **only on actual
+transitions** -- same "don't spam" principle as everything else in this
+project:
+
+```json
+{"event": "camera_offline", "timestamp": 1700000000}
+{"event": "camera_restored", "timestamp": 1700000000}
+```
+
+Two independent ways a failure is detected:
+
+- **Explicit**: the camera reports `{"status": "error", ...}` itself --
+  `camera_offline` fires immediately, no waiting.
+- **Implicit (silence)**: the camera stops sending heartbeats entirely
+  (crash, hang, unplugged) -- this is only detectable by the *absence* of
+  activity, so `status_loop.py` polls `CameraWatchdog.check_timeout()`
+  every second, independent of whether a heartbeat ever arrives again. If
+  more than `camera_watchdog.WATCHDOG_TIMEOUT_SECONDS` (12s, ~2.4x the 5s
+  heartbeat interval) passes with nothing heard, `camera_offline` fires.
+  A single `ok` heartbeat afterward fires `camera_restored`.
+
+**This path is fully independent** of the hazard/narration path and the
+haptic path -- no imports between them, no shared state. In particular,
+**`/ws/haptics` keeps working completely independently of camera status**:
+a camera failure degrades the system from "buzz + spoken context" down to
+"buzz only," never down to nothing, since the ToF-driven haptic reflex
+never depended on the camera to begin with. That's a real property of this
+architecture worth stating plainly, not an accident.
+
+Try it with:
+
+```bash
+source venv/bin/activate
+python test_status_client.py
+```
+
+You should see **nothing** print during normal operation -- this channel
+is silent except on actual transitions. To exercise it, from a Python
+shell with the server's venv active (or by temporarily calling it from
+code): `from pipeline.heartbeat_input import simulate_camera_failure;
+simulate_camera_failure(20.0)` stops the mock heartbeat entirely for 20s,
+simulating a real crash. After ~12s of that silence you should see exactly
+one `camera_offline` event, then exactly one `camera_restored` once
+heartbeats resume -- not a flood of either. `simulate_camera_error()` is
+the same idea for testing the explicit-error path instead of silence.
+
+**Integration point**: `pipeline/heartbeat_input.py`, replace
+`mock_heartbeat_stream()` with an async generator reading the real
+hardware's heartbeat channel, yielding the same
+`{"status": "ok"|"error", "timestamp": ...}` shape.
 
 ## Testing the throttle specifically
 

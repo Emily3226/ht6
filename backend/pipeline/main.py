@@ -1,5 +1,5 @@
 """
-Wires the full pipeline together and runs it as three independent
+Wires the full pipeline together and runs it as four independent
 background tasks alongside uvicorn:
 
     mock detection stream -> attach_distance() -> should_escalate()
@@ -13,11 +13,16 @@ background tasks alongside uvicorn:
         instance, checked BEFORE analysis) -> analyze_hazard() or
         narration_templates.build_up_hazard() -> broadcast_hazard()
 
+    mock heartbeat stream -> CameraWatchdog (record_heartbeat + periodic
+        check_timeout) -> broadcast_status() on /ws/status, transitions only
+
 Camera detections and overhead ("up") ToF triggers are two different
 origins that meet at narration_worker.py and share one HazardThrottle
 instance and one /ws/hazards broadcast from there on -- see
 narration_worker.py's docstring for why the throttle check happens before
-(not after) Gemini/template analysis.
+(not after) Gemini/template analysis. The camera-status path
+(status_loop.py) is entirely separate from all of this -- see its
+docstring for why.
 
 Run with:
     python -m pipeline.main                  # normal mode
@@ -51,6 +56,7 @@ from pipeline.detection_input import (
 from pipeline.haptic_loop import run_haptic_loop
 from pipeline.narration_worker import run_narration_worker
 from pipeline.server import DEFAULT_PORT, app, get_local_ip
+from pipeline.status_loop import run_status_loop
 from pipeline.throttle import HazardThrottle
 
 logger = logging.getLogger(__name__)
@@ -130,20 +136,22 @@ def main() -> None:
     # consistent across both.
     throttle = HazardThrottle()
 
-    # Three fully independent background tasks -- the lifespan hook in
+    # Four fully independent background tasks -- the lifespan hook in
     # server.py starts each as its own asyncio task, so a slow Gemini call
-    # in narration_worker can never delay run_haptic_loop or run_pipeline,
-    # or vice versa.
+    # in narration_worker can never delay run_haptic_loop, run_pipeline, or
+    # run_status_loop (camera health monitoring), or vice versa.
     app.state.on_startup_tasks = [
         lambda: run_pipeline(app.state.simulate_crash),
         run_haptic_loop,
         lambda: run_narration_worker(throttle),
+        run_status_loop,
     ]
 
     local_ip = get_local_ip()
     print(f"Health check:        http://{local_ip}:{DEFAULT_PORT}/health")
     print(f"Swift app should connect to: ws://{local_ip}:{DEFAULT_PORT}/ws/hazards")
     print(f"Haptic reflex path:  ws://{local_ip}:{DEFAULT_PORT}/ws/haptics")
+    print(f"Camera status path:  ws://{local_ip}:{DEFAULT_PORT}/ws/status")
     if app.state.simulate_crash:
         print("CRASH SIMULATION MODE enabled -- sustained chaotic hazard stream for ~2 minutes.")
 
