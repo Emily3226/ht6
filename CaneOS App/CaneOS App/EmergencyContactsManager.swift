@@ -1,6 +1,4 @@
 import Foundation
-import SwiftUI
-import Combine
 
 struct EmergencyContact: Identifiable, Codable {
     let id: UUID
@@ -9,10 +7,12 @@ struct EmergencyContact: Identifiable, Codable {
 }
 
 final class EmergencyContactsManager: ObservableObject {
+    static let shared = EmergencyContactsManager()
+
     @Published var contacts: [EmergencyContact] = []
     private let storageKey = "emergencyContacts"
 
-    init() { load() }
+    private init() { load() }
 
     func add(name: String, phoneNumber: String) {
         contacts.append(EmergencyContact(id: UUID(), name: name, phoneNumber: phoneNumber))

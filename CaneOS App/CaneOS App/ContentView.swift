@@ -26,6 +26,29 @@ struct ContentView: View {
                 NavigationLink("Emergency contacts") {
                     EmergencyContactsView(manager: contactsManager)
                 }
+
+                #if DEBUG
+                Divider()
+                Text("Debug — no backend needed").font(.caption).foregroundColor(.secondary)
+                Button("Simulate low-urgency hazard") {
+                    handleHazard(CaneMessage(
+                        type: "hazard", hazardType: "curb", direction: "left",
+                        urgency: "low", spokenDescription: "Curb ahead, step down.", text: nil
+                    ))
+                }
+                Button("Simulate HIGH-urgency hazard (fires SOS too)") {
+                    handleHazard(CaneMessage(
+                        type: "hazard", hazardType: "vehicle", direction: "right",
+                        urgency: "high", spokenDescription: "Car approaching fast, move left now.", text: nil
+                    ))
+                }
+                Button("Simulate scene description") {
+                    Task { await handleSceneDescription(CaneMessage(
+                        type: "scene_description", hazardType: nil, direction: nil,
+                        urgency: nil, spokenDescription: nil, text: "You are near a crosswalk. Traffic light is red."
+                    )) }
+                }
+                #endif
                 Spacer()
             }
             .padding()
