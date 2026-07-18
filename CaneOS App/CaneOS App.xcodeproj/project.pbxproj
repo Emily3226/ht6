@@ -45,7 +45,7 @@
 			path = "CaneOS App";
 			sourceTree = "<group>";
 		};
-		B7205432300B3E2F0082E536 /* CaneOS Watch App */ = {
+		B7205432300B3E2F0082E536 /* CaneOS Watch App Watch App */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			path = "CaneOS Watch App Watch App";
 			sourceTree = "<group>";
@@ -74,7 +74,7 @@
 			isa = PBXGroup;
 			children = (
 				B7205421300B3ACF0082E536 /* CaneOS App */,
-				B7205432300B3E2F0082E536 /* CaneOS Watch App */,
+				B7205432300B3E2F0082E536 /* CaneOS Watch App Watch App */,
 				B7205420300B3ACF0082E536 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -128,7 +128,7 @@
 			dependencies = (
 			);
 			fileSystemSynchronizedGroups = (
-				B7205432300B3E2F0082E536 /* CaneOS Watch App */,
+				B7205432300B3E2F0082E536 /* CaneOS Watch App Watch App */,
 			);
 			name = "CaneOS Watch App Watch App";
 			packageProductDependencies = (

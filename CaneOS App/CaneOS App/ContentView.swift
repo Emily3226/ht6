@@ -49,7 +49,7 @@ struct CaneMarkView: View {
 
 struct ContentView: View {
     @StateObject private var phoneSession    = PhoneSessionManager.shared
-    @StateObject private var contactsManager = EmergencyContactsManager()
+    @StateObject private var contactsManager = EmergencyContactsManager.shared
     @StateObject private var settings        = AppSettings.shared
     @StateObject private var incidents       = IncidentStore.shared
 
@@ -326,15 +326,27 @@ struct HomeView: View {
     }
 
     private var watchPill: some View {
-        HStack(spacing: 8) {
+        HStack(spacing: 12) {
             Image(systemName: isWatchConnected ? "applewatch" : "applewatch.slash")
+                .font(.title3)
                 .foregroundColor(isWatchConnected ? .caneBlue : Color(white: 0.40))
-            Text(isWatchConnected ? "Watch connected" : "Watch not reachable")
-                .font(.subheadline)
-                .foregroundColor(Color(white: 0.60))
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Apple Watch")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundColor(.white)
+                Text(isWatchConnected ? "Connected" : "Not reachable")
+                    .font(.caption)
+                    .foregroundColor(isWatchConnected ? .green : Color(white: 0.50))
+            }
             Spacer()
+            Circle()
+                .fill(isWatchConnected ? Color.green : Color(white: 0.25))
+                .frame(width: 8, height: 8)
         }
-        .padding(.horizontal, 4)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+        .background(Color.caneCard)
+        .cornerRadius(14)
         .accessibilityLabel(isWatchConnected
             ? "Apple Watch connected"
             : "Apple Watch not reachable")
@@ -396,12 +408,11 @@ struct SettingsView: View {
     var body: some View {
         ZStack {
             Color.caneNavy.ignoresSafeArea()
-            Form {
+            List {
                 Section {
                     settingRow(
-                        icon: "waveform.path",
                         title: "Haptic Intensity",
-                        hint: "Adjusts vibration motor strength on the clip module. Currently \(settings.hapticIntensity.label)"
+                        hint: "Adjusts vibration strength on the clip module. Currently \(settings.hapticIntensity.label)"
                     ) {
                         Picker("Haptic Intensity", selection: $settings.hapticIntensity) {
                             ForEach(AppSettings.HapticIntensity.allCases) { level in
@@ -410,13 +421,14 @@ struct SettingsView: View {
                         }
                         .pickerStyle(.segmented)
                     }
-                } header: { Text("Vibration") }
+                } header: {
+                    sectionHeader(icon: "waveform.path", title: "Vibration")
+                }
 
                 Section {
                     settingRow(
-                        icon: "sensor.tag.radiowaves.forward",
                         title: "Detection Sensitivity",
-                        hint: "Controls how aggressively the time-of-flight sensor flags movement. Currently \(settings.sensitivityLevel.label)"
+                        hint: "Controls how aggressively the sensor flags movement. Currently \(settings.sensitivityLevel.label)"
                     ) {
                         Picker("Sensitivity", selection: $settings.sensitivityLevel) {
                             ForEach(AppSettings.SensitivityLevel.allCases) { level in
@@ -425,40 +437,128 @@ struct SettingsView: View {
                         }
                         .pickerStyle(.segmented)
                     }
-                } header: { Text("Sensor") }
+                } header: {
+                    sectionHeader(icon: "sensor.tag.radiowaves.forward", title: "Sensor")
+                }
 
                 Section {
                     Toggle(isOn: $settings.audioEnabled) {
                         VStack(alignment: .leading, spacing: 4) {
-                            Label("Hazard Narration", systemImage: "speaker.wave.2.fill")
-                                .foregroundColor(.primary)
+                            Text("Hazard Narration")
+                                .font(.body.weight(.semibold))
+                                .foregroundColor(.white)
                             Text("Spoken obstacle descriptions via headphones")
                                 .font(.caption)
-                                .foregroundColor(.secondary)
+                                .foregroundColor(Color(white: 0.55))
                         }
                     }
                     .tint(.caneBlue)
+                    .listRowBackground(Color.caneCard)
                     .accessibilityLabel("Hazard audio narration \(settings.audioEnabled ? "on" : "off")")
-                    .accessibilityHint("Toggles ElevenLabs spoken descriptions for detected obstacles")
-                } header: { Text("Audio") }
+                    .accessibilityHint("Toggles spoken descriptions for detected obstacles")
+                } header: {
+                    sectionHeader(icon: "speaker.wave.2.fill", title: "Audio")
+                }
             }
+            .listStyle(.plain)
             .scrollContentBackground(.hidden)
         }
+        .toolbarBackground(Color.caneNavy, for: .navigationBar)
+        .toolbarColorScheme(.dark, for: .navigationBar)
+    }
+
+    private func sectionHeader(icon: String, title: String) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: icon)
+                .foregroundColor(.caneBlue)
+                .font(.subheadline.weight(.medium))
+            Text(title)
+                .font(.headline)
+                .foregroundColor(.white)
+        }
+        .textCase(nil)
+        .padding(.top, 6)
     }
 
     @ViewBuilder
     private func settingRow<Content: View>(
-        icon: String, title: String, hint: String,
+        title: String, hint: String,
         @ViewBuilder content: () -> Content
     ) -> some View {
         VStack(alignment: .leading, spacing: 10) {
-            Label(title, systemImage: icon)
-                .font(.body.weight(.medium))
+            Text(title)
+                .font(.body.weight(.semibold))
+                .foregroundColor(.white)
             content()
         }
-        .padding(.vertical, 4)
+        .padding(.vertical, 6)
+        .listRowBackground(Color.caneCard)
         .accessibilityElement(children: .combine)
         .accessibilityHint(hint)
+    }
+}
+
+// MARK: - Country dial codes
+
+private struct CountryDialCode: Identifiable, Hashable {
+    let id: String
+    let name: String
+    let dialCode: String
+    let maxDigits: Int
+    let formatTemplate: String  // '_' marks a digit slot; other chars are literals
+
+    static let all: [CountryDialCode] = [
+        CountryDialCode(id: "US", name: "United States",        dialCode: "+1",   maxDigits: 10, formatTemplate: "(___) ___-____"),
+        CountryDialCode(id: "CA", name: "Canada",               dialCode: "+1",   maxDigits: 10, formatTemplate: "(___) ___-____"),
+        CountryDialCode(id: "GB", name: "United Kingdom",       dialCode: "+44",  maxDigits: 10, formatTemplate: "____ ______"),
+        CountryDialCode(id: "AU", name: "Australia",            dialCode: "+61",  maxDigits: 9,  formatTemplate: "___ ___ ___"),
+        CountryDialCode(id: "IN", name: "India",                dialCode: "+91",  maxDigits: 10, formatTemplate: "_____-_____"),
+        CountryDialCode(id: "DE", name: "Germany",              dialCode: "+49",  maxDigits: 11, formatTemplate: "_____ ______"),
+        CountryDialCode(id: "FR", name: "France",               dialCode: "+33",  maxDigits: 9,  formatTemplate: "___ ___ ___"),
+        CountryDialCode(id: "JP", name: "Japan",                dialCode: "+81",  maxDigits: 10, formatTemplate: "__-____-____"),
+        CountryDialCode(id: "CN", name: "China",                dialCode: "+86",  maxDigits: 11, formatTemplate: "___-____-____"),
+        CountryDialCode(id: "BR", name: "Brazil",               dialCode: "+55",  maxDigits: 11, formatTemplate: "(__) _____-____"),
+        CountryDialCode(id: "MX", name: "Mexico",               dialCode: "+52",  maxDigits: 10, formatTemplate: "(__) ____-____"),
+        CountryDialCode(id: "ES", name: "Spain",                dialCode: "+34",  maxDigits: 9,  formatTemplate: "___-___-___"),
+        CountryDialCode(id: "IT", name: "Italy",                dialCode: "+39",  maxDigits: 10, formatTemplate: "___-____-___"),
+        CountryDialCode(id: "NL", name: "Netherlands",          dialCode: "+31",  maxDigits: 9,  formatTemplate: "__-___-____"),
+        CountryDialCode(id: "KR", name: "South Korea",          dialCode: "+82",  maxDigits: 10, formatTemplate: "___-___-____"),
+        CountryDialCode(id: "NG", name: "Nigeria",              dialCode: "+234", maxDigits: 10, formatTemplate: "___-___-____"),
+        CountryDialCode(id: "ZA", name: "South Africa",         dialCode: "+27",  maxDigits: 9,  formatTemplate: "__-___-____"),
+        CountryDialCode(id: "SG", name: "Singapore",            dialCode: "+65",  maxDigits: 8,  formatTemplate: "____-____"),
+        CountryDialCode(id: "AE", name: "United Arab Emirates", dialCode: "+971", maxDigits: 9,  formatTemplate: "__-___-____"),
+        CountryDialCode(id: "SE", name: "Sweden",               dialCode: "+46",  maxDigits: 9,  formatTemplate: "__-___-____"),
+        CountryDialCode(id: "NO", name: "Norway",               dialCode: "+47",  maxDigits: 8,  formatTemplate: "____-____"),
+        CountryDialCode(id: "PH", name: "Philippines",          dialCode: "+63",  maxDigits: 10, formatTemplate: "___-___-____"),
+        CountryDialCode(id: "PK", name: "Pakistan",             dialCode: "+92",  maxDigits: 10, formatTemplate: "___-_______"),
+        CountryDialCode(id: "TR", name: "Turkey",               dialCode: "+90",  maxDigits: 10, formatTemplate: "(___) ___-____"),
+        CountryDialCode(id: "SA", name: "Saudi Arabia",         dialCode: "+966", maxDigits: 9,  formatTemplate: "___-___-___"),
+        CountryDialCode(id: "AR", name: "Argentina",            dialCode: "+54",  maxDigits: 10, formatTemplate: "(__) ____-____"),
+        CountryDialCode(id: "NZ", name: "New Zealand",          dialCode: "+64",  maxDigits: 9,  formatTemplate: "___-___-___"),
+    ]
+
+    /// Splits a stored E.164-style number into its matching country and raw digit string.
+    static func parse(_ number: String) -> (country: CountryDialCode, digits: String) {
+        // Try longest dial codes first to avoid prefix ambiguity (e.g. +234 before +23)
+        let sorted = all.sorted { $0.dialCode.count > $1.dialCode.count }
+        for country in sorted where number.hasPrefix(country.dialCode) {
+            return (country, String(number.dropFirst(country.dialCode.count)))
+        }
+        return (all[0], number.filter { $0.isNumber })
+    }
+}
+
+// MARK: - Conflict alert state
+
+private enum ConflictType {
+    case primary(EmergencyContact)
+    case secondary(EmergencyContact)
+
+    var alertTitle: String {
+        switch self {
+        case .primary:  "Primary Contact Conflict"
+        case .secondary: "Secondary Contact Conflict"
+        }
     }
 }
 
@@ -468,26 +568,293 @@ struct SafetyView: View {
     @ObservedObject var contactsManager: EmergencyContactsManager
     let onSOS: () -> Void
 
-    @State private var newName  = ""
+    @State private var newName = ""
     @State private var newPhone = ""
+    @State private var selectedCountry = CountryDialCode.all[0]
     @State private var newCarrier: Carrier = .bell
+    @State private var newPriority: ContactPriority = .none
+    @State private var phoneError: String?
+    @State private var pendingConflict: ConflictType?
+    @State private var editingContact: EmergencyContact?
     @GestureState private var isPressing = false
     @State private var holdProgress: Double = 0
     @State private var holdTimer: Timer?
     @State private var sosFired = false
 
     private let holdDuration = 3.0
+    private var canAdd: Bool { !newName.isEmpty && !newPhone.isEmpty }
+
+    @ViewBuilder
+    private func priorityBadge(_ priority: ContactPriority) -> some View {
+        Text(priority == .primary ? "PRIMARY" : "SECONDARY")
+            .font(.system(size: 9, weight: .bold))
+            .tracking(0.4)
+            .padding(.horizontal, 5)
+            .padding(.vertical, 2)
+            .background(priority == .primary
+                        ? Color.caneBlue.opacity(0.22)
+                        : Color.orange.opacity(0.20))
+            .foregroundColor(priority == .primary ? Color.caneBlue : Color.orange)
+            .cornerRadius(3)
+    }
+
+    // Renders the format template with typed digits in white and empty slots dimmed
+    private var phoneFormatMask: some View {
+        var attributed = AttributedString()
+        var idx = newPhone.startIndex
+        for ch in selectedCountry.formatTemplate {
+            if ch == "_" {
+                if idx < newPhone.endIndex {
+                    var a = AttributedString(String(newPhone[idx]))
+                    a.foregroundColor = .white
+                    attributed += a
+                    idx = newPhone.index(after: idx)
+                } else {
+                    var a = AttributedString("_")
+                    a.foregroundColor = Color(white: 0.28)
+                    attributed += a
+                }
+            } else {
+                var a = AttributedString(String(ch))
+                a.foregroundColor = Color(white: 0.45)
+                attributed += a
+            }
+        }
+        return Text(attributed)
+            .font(.system(size: 15, design: .monospaced))
+    }
 
     var body: some View {
-        ZStack {
-            Color.caneNavy.ignoresSafeArea()
-            ScrollView {
-                VStack(spacing: 28) {
-                    sosButtonSection
-                    Divider().background(Color(white: 0.18)).padding(.horizontal)
-                    contactsSection
+        List {
+            // SOS button — full-bleed row inside the list
+            Section {
+                sosButtonSection
+                    .listRowBackground(Color.caneNavy)
+                    .listRowInsets(EdgeInsets())
+            }
+
+            // Add-contact form — blue header makes it clearly the input area
+            Section {
+                TextField("Name", text: $newName)
+                    .listRowBackground(Color.caneCard)
+
+                Picker("Country", selection: $selectedCountry) {
+                    ForEach(CountryDialCode.all) { country in
+                        Text("\(country.name) (\(country.dialCode))").tag(country)
+                    }
                 }
-                .padding()
+                .pickerStyle(.menu)
+                .tint(Color.caneBlue)
+                .listRowBackground(Color.caneCard)
+
+                // Phone field — digits only, capped at country max, live format mask below
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack(spacing: 8) {
+                        Text(selectedCountry.dialCode)
+                            .foregroundColor(Color(white: 0.55))
+                        TextField("Phone number", text: $newPhone)
+                            .keyboardType(.phonePad)
+                            .onChange(of: newPhone) { _, newValue in
+                                let digits = newValue.filter { $0.isNumber }
+                                let limited = String(digits.prefix(selectedCountry.maxDigits))
+                                if limited != newPhone { newPhone = limited }
+                                phoneError = nil
+                            }
+                    }
+                    phoneFormatMask
+                    if let error = phoneError {
+                        Text(error).font(.caption).foregroundColor(.red)
+                    }
+                }
+                .listRowBackground(Color.caneCard)
+                .onChange(of: selectedCountry) { _, _ in
+                    newPhone = ""
+                    phoneError = nil
+                }
+
+                // Carrier — needed to build the email-to-SMS gateway address
+                // that SOSManager sends the emergency alert to.
+                Picker("Carrier", selection: $newCarrier) {
+                    ForEach(Carrier.allCases) { carrier in
+                        Text(carrier.displayName).tag(carrier)
+                    }
+                }
+                .pickerStyle(.menu)
+                .tint(Color.caneBlue)
+                .listRowBackground(Color.caneCard)
+                .accessibilityHint("Needed so SOS alerts can be delivered as a text message")
+
+                Picker("Priority", selection: $newPriority) {
+                    Text("No priority").tag(ContactPriority.none)
+                    Text("Primary contact").tag(ContactPriority.primary)
+                    Text("Secondary contact").tag(ContactPriority.secondary)
+                }
+                .pickerStyle(.menu)
+                .tint(newPriority == .primary ? Color.caneBlue
+                      : newPriority == .secondary ? Color.orange
+                      : Color(white: 0.55))
+                .listRowBackground(Color.caneCard)
+
+                Button(action: addContact) {
+                    Label("Add Contact", systemImage: "plus.circle.fill")
+                        .frame(maxWidth: .infinity, alignment: .center)
+                        .foregroundColor(.white)
+                }
+                .disabled(!canAdd)
+                .listRowBackground(canAdd ? Color.caneBlue : Color(white: 0.18))
+                .accessibilityLabel("Add emergency contact")
+            } header: {
+                HStack(spacing: 6) {
+                    Image(systemName: "person.badge.plus")
+                    Text("ADD NEW CONTACT")
+                }
+                .font(.caption.bold())
+                .foregroundColor(Color.caneBlue)
+                .textCase(nil)
+            }
+
+            // Saved contacts — distinct header, sorted: primary → secondary → A-Z
+            Section {
+                if contactsManager.contacts.isEmpty {
+                    Text("No emergency contacts yet.\nAdd one above.")
+                        .font(.subheadline)
+                        .foregroundColor(Color(white: 0.40))
+                        .multilineTextAlignment(.center)
+                        .frame(maxWidth: .infinity)
+                        .listRowBackground(Color.caneNavy)
+                } else {
+                    ForEach(contactsManager.sortedContacts) { contact in
+                        HStack(spacing: 12) {
+                            // Coloured left stripe for primary/secondary
+                            RoundedRectangle(cornerRadius: 2)
+                                .fill(contact.priority == .primary ? Color.caneBlue
+                                      : contact.priority == .secondary ? Color.orange
+                                      : Color.clear)
+                                .frame(width: 3)
+
+                            VStack(alignment: .leading, spacing: 5) {
+                                HStack(spacing: 7) {
+                                    Text(contact.name)
+                                        .font(.headline)
+                                        .foregroundColor(.white)
+                                    if contact.priority != .none {
+                                        priorityBadge(contact.priority)
+                                    }
+                                }
+                                Text(contact.phoneNumber)
+                                    .font(.subheadline)
+                                    .foregroundColor(Color(white: 0.55))
+                                Text(contact.carrier.displayName)
+                                    .font(.caption)
+                                    .foregroundColor(Color(white: 0.40))
+                            }
+                            Spacer()
+                        }
+                        .padding(.vertical, 4)
+                        .accessibilityElement(children: .combine)
+                        .accessibilityLabel("Emergency contact: \(contact.name), \(contact.phoneNumber)\(contact.priority != .none ? ", \(contact.priority.rawValue) contact" : "")")
+                        .listRowBackground(Color.caneCard)
+                        .swipeActions(edge: .leading, allowsFullSwipe: false) {
+                            Button {
+                                editingContact = contact
+                            } label: {
+                                Label("Edit", systemImage: "pencil")
+                            }
+                            .tint(Color.caneBlue)
+                        }
+                        .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                            Button(role: .destructive) {
+                                if let i = contactsManager.contacts.firstIndex(where: { $0.id == contact.id }) {
+                                    contactsManager.remove(at: IndexSet(integer: i))
+                                }
+                            } label: {
+                                Label("Delete", systemImage: "trash")
+                            }
+                        }
+                        .contextMenu {
+                            if contact.priority != .primary {
+                                Button {
+                                    contactsManager.setPriority(.primary, for: contact.id)
+                                } label: {
+                                    Label("Set as Primary", systemImage: "star.fill")
+                                }
+                            }
+                            if contact.priority != .secondary {
+                                Button {
+                                    contactsManager.setPriority(.secondary, for: contact.id)
+                                } label: {
+                                    Label("Set as Secondary", systemImage: "star.leadinghalf.filled")
+                                }
+                            }
+                            if contact.priority != .none {
+                                Divider()
+                                Button(role: .destructive) {
+                                    contactsManager.setPriority(.none, for: contact.id)
+                                } label: {
+                                    Label("Remove Priority", systemImage: "star.slash")
+                                }
+                            }
+                        }
+                    }
+                }
+            } header: {
+                HStack {
+                    HStack(spacing: 6) {
+                        Image(systemName: "person.2.fill")
+                        Text("SAVED CONTACTS")
+                    }
+                    .font(.caption.bold())
+                    .foregroundColor(.white)
+                    .textCase(nil)
+                    Spacer()
+                    if !contactsManager.contacts.isEmpty {
+                        Text("\(contactsManager.contacts.count)")
+                            .font(.caption.bold())
+                            .monospacedDigit()
+                            .padding(.horizontal, 7)
+                            .padding(.vertical, 2)
+                            .background(Color(white: 0.18))
+                            .foregroundColor(Color(white: 0.55))
+                            .cornerRadius(8)
+                    }
+                }
+                .padding(.top, 8)
+            }
+        }
+        .listStyle(.plain)
+        .scrollContentBackground(.hidden)
+        .background(Color.caneNavy)
+        .sheet(item: $editingContact) { contact in
+            EditContactSheet(contact: contact, manager: contactsManager) {
+                editingContact = nil
+            }
+        }
+        .alert(
+            pendingConflict?.alertTitle ?? "",
+            isPresented: Binding(
+                get: { pendingConflict != nil },
+                set: { if !$0 { pendingConflict = nil } }
+            ),
+            presenting: pendingConflict
+        ) { conflict in
+            if case .primary(let existing) = conflict {
+                Button("Make \(newName) primary, bump \(existing.name) to secondary") {
+                    commitAdd(bumpPrimary: true)
+                }
+                Button("Make \(newName) primary") {
+                    commitAdd(bumpPrimary: false)
+                }
+            } else if case .secondary(let existing) = conflict {
+                Button("Make \(newName) secondary, bump \(existing.name) to normal") {
+                    commitAdd(bumpPrimary: false)
+                }
+            }
+            Button("Cancel", role: .cancel) { }
+        } message: { conflict in
+            if case .primary(let existing) = conflict {
+                Text("\(existing.name) is already set as your primary contact.")
+            } else if case .secondary(let existing) = conflict {
+                Text("\(existing.name) is already set as your secondary contact.")
             }
         }
         .onChange(of: isPressing) { _, pressing in
@@ -541,109 +908,46 @@ struct SafetyView: View {
                 .multilineTextAlignment(.center)
         }
         .frame(maxWidth: .infinity)
-    }
-
-    private var contactsSection: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            Text("Emergency Contacts")
-                .font(.title3.bold())
-                .foregroundColor(.white)
-
-            // Add form
-            VStack(spacing: 10) {
-                TextField("Name", text: $newName)
-                    .padding(12)
-                    .background(Color.caneCard)
-                    .cornerRadius(10)
-                    .accessibilityLabel("New contact name")
-
-                TextField("Phone number", text: $newPhone)
-                    .padding(12)
-                    .background(Color.caneCard)
-                    .cornerRadius(10)
-                    .keyboardType(.phonePad)
-                    .accessibilityLabel("New contact phone number")
-
-                Picker("Carrier", selection: $newCarrier) {
-                    ForEach(Carrier.allCases) { carrier in
-                        Text(carrier.displayName).tag(carrier)
-                    }
-                }
-                .pickerStyle(.menu)
-                .tint(.white)
-                .padding(12)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(Color.caneCard)
-                .cornerRadius(10)
-                .accessibilityLabel("New contact's mobile carrier")
-                .accessibilityHint("Needed so SOS alerts can be delivered as a text message")
-
-                Button(action: addContact) {
-                    Label("Add Contact", systemImage: "plus.circle.fill")
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 14)
-                        .background((newName.isEmpty || newPhone.isEmpty)
-                            ? Color(white: 0.18)
-                            : Color.caneBlue)
-                        .foregroundColor(.white)
-                        .cornerRadius(12)
-                }
-                .disabled(newName.isEmpty || newPhone.isEmpty)
-                .accessibilityLabel("Add emergency contact")
-            }
-
-            // Contact list
-            if contactsManager.contacts.isEmpty {
-                Text("No emergency contacts yet.\nAdd one above.")
-                    .font(.subheadline)
-                    .foregroundColor(Color(white: 0.40))
-                    .multilineTextAlignment(.center)
-                    .frame(maxWidth: .infinity)
-                    .padding(.top, 8)
-            } else {
-                ForEach(contactsManager.contacts) { contact in
-                    contactRow(contact)
-                }
-            }
-        }
-    }
-
-    private func contactRow(_ contact: EmergencyContact) -> some View {
-        HStack(spacing: 14) {
-            VStack(alignment: .leading, spacing: 4) {
-                Text(contact.name)
-                    .font(.headline)
-                    .foregroundColor(.white)
-                Text(contact.phoneNumber)
-                    .font(.subheadline)
-                    .foregroundColor(Color(white: 0.55))
-                Text(contact.carrier.displayName)
-                    .font(.caption)
-                    .foregroundColor(Color(white: 0.40))
-            }
-            Spacer()
-            Button(role: .destructive) {
-                if let i = contactsManager.contacts.firstIndex(where: { $0.id == contact.id }) {
-                    contactsManager.remove(at: IndexSet(integer: i))
-                }
-            } label: {
-                Image(systemName: "trash.circle.fill")
-                    .font(.title2)
-                    .foregroundColor(Color.red.opacity(0.85))
-            }
-            .accessibilityLabel("Remove \(contact.name)")
-        }
-        .padding(16)
-        .background(Color.caneCard)
-        .cornerRadius(14)
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel("Emergency contact: \(contact.name), \(contact.phoneNumber)")
+        .padding(.vertical, 16)
     }
 
     private func addContact() {
-        guard !newName.isEmpty, !newPhone.isEmpty else { return }
-        contactsManager.add(name: newName, phoneNumber: newPhone, carrier: newCarrier)
-        newName = ""; newPhone = ""; newCarrier = .bell
+        let digits = newPhone.filter { $0.isNumber }
+        guard digits.count >= 7 else {
+            phoneError = "Enter at least 7 digits"
+            return
+        }
+        guard digits.count <= 15 else {
+            phoneError = "Number too long (max 15 digits)"
+            return
+        }
+        if newPriority == .primary,
+           let existing = contactsManager.contacts.first(where: { $0.priority == .primary }) {
+            pendingConflict = .primary(existing)
+            return
+        }
+        if newPriority == .secondary,
+           let existing = contactsManager.contacts.first(where: { $0.priority == .secondary }) {
+            pendingConflict = .secondary(existing)
+            return
+        }
+        commitAdd(bumpPrimary: false)
+    }
+
+    private func commitAdd(bumpPrimary: Bool) {
+        let digits = newPhone.filter { $0.isNumber }
+        contactsManager.add(
+            name: newName,
+            phoneNumber: "\(selectedCountry.dialCode)\(digits)",
+            carrier: newCarrier,
+            priority: newPriority,
+            bumpExistingPrimaryToSecondary: bumpPrimary
+        )
+        newName = ""
+        newPhone = ""
+        newCarrier = .bell
+        newPriority = .none
+        phoneError = nil
     }
 
     private func startHold() {
@@ -665,6 +969,206 @@ struct SafetyView: View {
         sosFired = true
         onSOS()
         DispatchQueue.main.asyncAfter(deadline: .now() + 4) { sosFired = false }
+    }
+}
+
+// MARK: - Edit contact sheet
+
+private struct EditContactSheet: View {
+    let contact: EmergencyContact
+    @ObservedObject var manager: EmergencyContactsManager
+    let onDismiss: () -> Void
+
+    @State private var name: String
+    @State private var phone: String
+    @State private var selectedCountry: CountryDialCode
+    @State private var carrier: Carrier
+    @State private var priority: ContactPriority
+    @State private var phoneError: String?
+    @State private var pendingConflict: ConflictType?
+
+    init(contact: EmergencyContact, manager: EmergencyContactsManager, onDismiss: @escaping () -> Void) {
+        self.contact = contact
+        self.manager = manager
+        self.onDismiss = onDismiss
+        let parsed = CountryDialCode.parse(contact.phoneNumber)
+        _name            = State(initialValue: contact.name)
+        _phone           = State(initialValue: parsed.digits)
+        _selectedCountry = State(initialValue: parsed.country)
+        _carrier         = State(initialValue: contact.carrier)
+        _priority        = State(initialValue: contact.priority)
+    }
+
+    private var existingPrimary: EmergencyContact? {
+        manager.contacts.first { $0.priority == .primary && $0.id != contact.id }
+    }
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section {
+                    TextField("Name", text: $name)
+                        .listRowBackground(Color.caneCard)
+                } header: { Text("Name").foregroundColor(Color(white: 0.55)) }
+
+                Section {
+                    Picker("Country", selection: $selectedCountry) {
+                        ForEach(CountryDialCode.all) { country in
+                            Text("\(country.name) (\(country.dialCode))").tag(country)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    .tint(Color.caneBlue)
+                    .listRowBackground(Color.caneCard)
+
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack(spacing: 8) {
+                            Text(selectedCountry.dialCode)
+                                .foregroundColor(Color(white: 0.55))
+                            TextField("Phone number", text: $phone)
+                                .keyboardType(.phonePad)
+                                .onChange(of: phone) { _, newValue in
+                                    let digits = newValue.filter { $0.isNumber }
+                                    let limited = String(digits.prefix(selectedCountry.maxDigits))
+                                    if limited != phone { phone = limited }
+                                    phoneError = nil
+                                }
+                        }
+                        phoneFormatMask
+                        if let error = phoneError {
+                            Text(error).font(.caption).foregroundColor(.red)
+                        }
+                    }
+                    .listRowBackground(Color.caneCard)
+                    .onChange(of: selectedCountry) { _, _ in
+                        phone = ""
+                        phoneError = nil
+                    }
+                } header: { Text("Phone Number").foregroundColor(Color(white: 0.55)) }
+
+                Section {
+                    Picker("Carrier", selection: $carrier) {
+                        ForEach(Carrier.allCases) { c in
+                            Text(c.displayName).tag(c)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    .tint(Color.caneBlue)
+                    .listRowBackground(Color.caneCard)
+                } header: { Text("Carrier").foregroundColor(Color(white: 0.55)) }
+
+                Section {
+                    Picker("Priority", selection: $priority) {
+                        Text("No priority").tag(ContactPriority.none)
+                        Text("Primary contact").tag(ContactPriority.primary)
+                        Text("Secondary contact").tag(ContactPriority.secondary)
+                    }
+                    .pickerStyle(.menu)
+                    .tint(priority == .primary ? Color.caneBlue
+                          : priority == .secondary ? Color.orange
+                          : Color(white: 0.55))
+                    .listRowBackground(Color.caneCard)
+                } header: { Text("Priority").foregroundColor(Color(white: 0.55)) }
+            }
+            .listStyle(.plain)
+            .scrollContentBackground(.hidden)
+            .background(Color.caneNavy)
+            .navigationTitle("Edit Contact")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbarBackground(Color.caneNavy, for: .navigationBar)
+            .toolbarColorScheme(.dark, for: .navigationBar)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel", action: onDismiss).foregroundColor(Color.caneBlue)
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Save", action: attemptSave)
+                        .foregroundColor(Color.caneBlue)
+                        .disabled(name.trimmingCharacters(in: .whitespaces).isEmpty)
+                }
+            }
+            .alert(
+                pendingConflict?.alertTitle ?? "",
+                isPresented: Binding(
+                    get: { pendingConflict != nil },
+                    set: { if !$0 { pendingConflict = nil } }
+                ),
+                presenting: pendingConflict
+            ) { conflict in
+                if case .primary(let existing) = conflict {
+                    Button("Make \(name) primary, bump \(existing.name) to secondary") {
+                        commitSave(bump: true)
+                    }
+                    Button("Make \(name) primary") {
+                        commitSave(bump: false)
+                    }
+                } else if case .secondary(let existing) = conflict {
+                    Button("Make \(name) secondary, bump \(existing.name) to normal") {
+                        commitSave(bump: false)
+                    }
+                }
+                Button("Cancel", role: .cancel) { }
+            } message: { conflict in
+                if case .primary(let existing) = conflict {
+                    Text("\(existing.name) is already set as your primary contact.")
+                } else if case .secondary(let existing) = conflict {
+                    Text("\(existing.name) is already set as your secondary contact.")
+                }
+            }
+        }
+    }
+
+    private var phoneFormatMask: some View {
+        var attributed = AttributedString()
+        var idx = phone.startIndex
+        for ch in selectedCountry.formatTemplate {
+            if ch == "_" {
+                if idx < phone.endIndex {
+                    var a = AttributedString(String(phone[idx]))
+                    a.foregroundColor = .white
+                    attributed += a
+                    idx = phone.index(after: idx)
+                } else {
+                    var a = AttributedString("_")
+                    a.foregroundColor = Color(white: 0.28)
+                    attributed += a
+                }
+            } else {
+                var a = AttributedString(String(ch))
+                a.foregroundColor = Color(white: 0.45)
+                attributed += a
+            }
+        }
+        return Text(attributed)
+            .font(.system(size: 15, design: .monospaced))
+    }
+
+    private func attemptSave() {
+        let trimmed = name.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty else { return }
+        guard phone.count >= 7 else { phoneError = "Enter at least 7 digits"; return }
+        if priority == .primary, let existing = existingPrimary {
+            pendingConflict = .primary(existing)
+            return
+        }
+        if priority == .secondary,
+           let existing = manager.contacts.first(where: { $0.priority == .secondary && $0.id != contact.id }) {
+            pendingConflict = .secondary(existing)
+            return
+        }
+        commitSave(bump: false)
+    }
+
+    private func commitSave(bump: Bool) {
+        manager.update(
+            id: contact.id,
+            name: name.trimmingCharacters(in: .whitespaces),
+            phoneNumber: "\(selectedCountry.dialCode)\(phone)",
+            carrier: carrier,
+            priority: priority,
+            bumpExistingPrimaryToSecondary: bump
+        )
+        onDismiss()
     }
 }
 

@@ -1,4 +1,16 @@
 import Foundation
+import Combine
+import SwiftUI
+
+/// Priority level for an emergency contact -- primary and secondary are each
+/// unique (only one contact can hold each at a time), used to order SOS
+/// alerts and to highlight contacts in the Safety tab.
+/// NOTE: if this enum already exists in another file in your project (it's
+/// referenced throughout ContentView.swift but wasn't included in either
+/// side of the conflict), delete this definition here to avoid a duplicate.
+enum ContactPriority: String, Codable {
+    case none, primary, secondary
+}
 
 /// Mobile carrier, used to build an email-to-SMS gateway address
 /// (e.g. "6135551234@txt.bell.ca"). We route SOS alerts through the
@@ -54,6 +66,7 @@ struct EmergencyContact: Identifiable, Codable {
     var name: String
     var phoneNumber: String
     var carrier: Carrier
+    var priority: ContactPriority = .none
 
     /// The email address that, when sent an email, gets delivered to this
     /// contact's phone as a text message via their carrier's SMS gateway.
@@ -76,13 +89,84 @@ final class EmergencyContactsManager: ObservableObject {
 
     private init() { load() }
 
-    func add(name: String, phoneNumber: String, carrier: Carrier) {
-        contacts.append(EmergencyContact(id: UUID(), name: name, phoneNumber: phoneNumber, carrier: carrier))
+    /// Primary first, secondary second, then the rest sorted A–Z.
+    var sortedContacts: [EmergencyContact] {
+        let primary   = contacts.filter { $0.priority == .primary }
+        let secondary = contacts.filter { $0.priority == .secondary }
+        let rest      = contacts.filter { $0.priority == .none }
+                                .sorted { $0.name.localizedCompare($1.name) == .orderedAscending }
+        return primary + secondary + rest
+    }
+
+    func add(
+        name: String,
+        phoneNumber: String,
+        carrier: Carrier,
+        priority: ContactPriority = .none,
+        bumpExistingPrimaryToSecondary: Bool = false
+    ) {
+        if priority == .primary && bumpExistingPrimaryToSecondary {
+            for i in contacts.indices where contacts[i].priority == .secondary {
+                contacts[i].priority = .none
+            }
+            for i in contacts.indices where contacts[i].priority == .primary {
+                contacts[i].priority = .secondary
+            }
+        } else if priority != .none {
+            for i in contacts.indices where contacts[i].priority == priority {
+                contacts[i].priority = .none
+            }
+        }
+        contacts.append(EmergencyContact(id: UUID(), name: name, phoneNumber: phoneNumber, carrier: carrier, priority: priority))
         save()
     }
 
     func remove(at offsets: IndexSet) {
         contacts.remove(atOffsets: offsets)
+        save()
+    }
+
+    /// Edit an existing contact. Pass `bumpExistingPrimaryToSecondary: true` to move
+    /// the current primary to secondary instead of clearing it when promoting a new primary.
+    func update(
+        id: UUID,
+        name: String,
+        phoneNumber: String,
+        carrier: Carrier,
+        priority: ContactPriority,
+        bumpExistingPrimaryToSecondary: Bool = false
+    ) {
+        if priority == .primary && bumpExistingPrimaryToSecondary {
+            for i in contacts.indices where contacts[i].priority == .secondary && contacts[i].id != id {
+                contacts[i].priority = .none
+            }
+            for i in contacts.indices where contacts[i].priority == .primary && contacts[i].id != id {
+                contacts[i].priority = .secondary
+            }
+        } else if priority != .none {
+            for i in contacts.indices where contacts[i].priority == priority && contacts[i].id != id {
+                contacts[i].priority = .none
+            }
+        }
+        if let i = contacts.firstIndex(where: { $0.id == id }) {
+            contacts[i].name        = name
+            contacts[i].phoneNumber = phoneNumber
+            contacts[i].carrier     = carrier
+            contacts[i].priority    = priority
+        }
+        save()
+    }
+
+    /// Assign a priority to one contact; any existing holder of that priority is demoted to none.
+    func setPriority(_ priority: ContactPriority, for id: UUID) {
+        if priority != .none {
+            for i in contacts.indices where contacts[i].priority == priority {
+                contacts[i].priority = .none
+            }
+        }
+        if let i = contacts.firstIndex(where: { $0.id == id }) {
+            contacts[i].priority = priority
+        }
         save()
     }
 

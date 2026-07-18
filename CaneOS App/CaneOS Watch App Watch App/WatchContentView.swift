@@ -63,23 +63,26 @@ struct WatchMainView: View {
 
             VStack(spacing: 6) {
                 // Logo wordmark
-                HStack(spacing: 4) {
-                    CaneMarkView(height: 16, color: Color(red: 0.12, green: 0.46, blue: 1.00))
+                HStack(spacing: 5) {
+                    CaneMarkView(height: 18, color: Color(red: 0.12, green: 0.46, blue: 1.00))
                     Text("CaneOS")
-                        .font(.system(size: 11, weight: .black))
+                        .font(.system(size: 13, weight: .black))
                         .foregroundColor(.white)
                         .tracking(0.8)
                 }
 
                 // Connection pill
-                HStack(spacing: 4) {
+                HStack(spacing: 5) {
                     Circle()
-                        .fill(session.isPhoneReachable ? Color.green : Color.gray)
-                        .frame(width: 6, height: 6)
-                    Text(session.isPhoneReachable ? "Connected" : "No phone")
-                        .font(.system(size: 10))
-                        .foregroundColor(Color(white: 0.50))
+                        .fill(session.isPhoneReachable ? Color.green : Color(white: 0.35))
+                        .frame(width: 7, height: 7)
+                    Text(session.isPhoneReachable ? "Phone connected" : "No phone")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundColor(session.isPhoneReachable ? .white : Color(white: 0.55))
                 }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(Color(white: 0.12).cornerRadius(8))
                 .accessibilityLabel(session.isPhoneReachable
                     ? "Phone connected"
                     : "Phone not reachable")
@@ -94,7 +97,7 @@ struct WatchMainView: View {
                                 .font(.system(size: 22, weight: .medium))
                                 .foregroundColor(.white)
                             Text("What's\naround me?")
-                                .font(.system(size: 10, weight: .bold))
+                                .font(.system(size: 11, weight: .bold))
                                 .foregroundColor(.white)
                                 .multilineTextAlignment(.center)
                         }
@@ -108,9 +111,14 @@ struct WatchMainView: View {
 
                 // Last hazard direction
                 if session.lastDirection != "-" {
-                    Text("Last: \(session.lastDirection)")
-                        .font(.system(size: 9))
-                        .foregroundColor(Color(white: 0.40))
+                    HStack(spacing: 4) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.system(size: 8))
+                            .foregroundColor(Color.yellow.opacity(0.80))
+                        Text(session.lastDirection.capitalized)
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundColor(Color(white: 0.70))
+                    }
                 }
             }
             .padding(.vertical, 8)
@@ -125,7 +133,7 @@ struct WatchSettingsView: View {
 
     var body: some View {
         List {
-            Section("Vibration") {
+            Section {
                 Picker("Intensity", selection: $session.hapticIntensity) {
                     Text("Low").tag("low")
                     Text("Med").tag("medium")
@@ -133,12 +141,22 @@ struct WatchSettingsView: View {
                 }
                 .accessibilityLabel("Haptic intensity: \(session.hapticIntensity)")
                 .accessibilityHint("Use the digital crown to change vibration strength")
+            } header: {
+                Label("Vibration", systemImage: "waveform.path")
+                    .font(.subheadline.weight(.bold))
+                    .foregroundColor(.white)
+                    .textCase(nil)
             }
-            Section("Audio") {
+            Section {
                 Toggle("Narration", isOn: $session.audioEnabled)
                     .tint(Color(red: 0.12, green: 0.46, blue: 1.00))
                     .accessibilityLabel("Audio narration \(session.audioEnabled ? "on" : "off")")
                     .accessibilityHint("Toggles spoken obstacle descriptions")
+            } header: {
+                Label("Audio", systemImage: "speaker.wave.2.fill")
+                    .font(.subheadline.weight(.bold))
+                    .foregroundColor(.white)
+                    .textCase(nil)
             }
         }
         .listStyle(.elliptical)

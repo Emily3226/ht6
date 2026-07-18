@@ -1,5 +1,6 @@
 import Foundation
 import WatchConnectivity
+import Combine
 
 /// How strong the Watch buzz feels. watchOS doesn't expose true variable-intensity
 /// haptics to third-party apps (no Core Haptics on watchOS) — so "strength" here is
