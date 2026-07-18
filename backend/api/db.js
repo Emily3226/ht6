@@ -101,6 +101,16 @@ module.exports = async (req, res) => {
         return res.status(400).json({ error: 'database and collection are required' });
     }
 
+    // Live location sharing: a signed-in support partner may read another
+    // user's shared_locations document, but only by presenting its share
+    // code — an explicit grant handed over by the sharing user. Writes to
+    // shared_locations stay scoped to the token's own subject.
+    const isShareCodeRead =
+        collection === 'shared_locations' &&
+        action === 'find' &&
+        typeof (rest.filter || {}).shareCode === 'string';
+    const scopeUid = isShareCodeRead ? null : authedUserId;
+
     try {
         const col = await getCollection(database, collection);
 
@@ -120,7 +130,7 @@ module.exports = async (req, res) => {
                 });
             }
             case 'find': {
-                let cursor = col.find(scopeFilter(rest.filter, authedUserId));
+                let cursor = col.find(scopeFilter(rest.filter, scopeUid));
                 if (rest.sort) cursor = cursor.sort(rest.sort);
                 const documents = await cursor.toArray();
                 return res.json({ documents });

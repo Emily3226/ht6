@@ -35,6 +35,9 @@ final class AuthManager: ObservableObject {
     @Published var userEmail:  String?
     @Published var userPicture: URL?
     @Published var isSyncing   = false
+    /// True while checking for a stored session at launch, so the UI can
+    /// hold on a splash instead of flashing the sign-in screen.
+    @Published var isRestoring = true
 
     private let credManager = CredentialsManager(authentication: Auth0.authentication())
 
@@ -72,6 +75,10 @@ final class AuthManager: ObservableObject {
         try? credManager.clear()
         isAuthenticated = false
         userId = nil; userName = nil; userEmail = nil; userPicture = nil
+        // Role belongs to the account, not the device — clear it so the next
+        // sign-in restores it from that account's cloud settings (or shows
+        // account setup for a fresh account).
+        AppSettings.shared.userRole = nil
     }
 
     /// A fresh Auth0 ID token for authenticating backend requests.
@@ -113,6 +120,7 @@ final class AuthManager: ObservableObject {
     }
 
     private func restoreSession() async {
+        defer { isRestoring = false }
         do {
             let creds = try await credManager.credentials()
             let profile = try await Auth0.authentication()

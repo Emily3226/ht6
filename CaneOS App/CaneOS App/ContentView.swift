@@ -72,6 +72,31 @@ struct ContentView: View {
     private let backboard  = BackboardClient(apiKey: Config.backboardAPIKey)
 
     var body: some View {
+        // Launch flow: hold on a splash while the stored Auth0 session
+        // restores → sign in → pick a role (account setup) → the app.
+        Group {
+            if auth.isRestoring {
+                ZStack {
+                    Color.caneNavy.ignoresSafeArea()
+                    VStack(spacing: 16) {
+                        CaneMarkView(height: 64, color: .caneBlue)
+                        ProgressView().tint(.caneBlue)
+                    }
+                }
+            } else if !auth.isAuthenticated {
+                WelcomeView(auth: auth)
+            } else if settings.userRole == nil {
+                RoleSelectionView(auth: auth, settings: settings)
+            } else {
+                mainTabs
+            }
+        }
+        .onChange(of: settings.locationSharingEnabled) { syncLocationSharing() }
+        .onChange(of: settings.userRole) { syncLocationSharing() }
+        .onChange(of: auth.isAuthenticated) { syncLocationSharing() }
+    }
+
+    private var mainTabs: some View {
         TabView {
             NavigationStack {
                 HomeView(
@@ -99,6 +124,16 @@ struct ContentView: View {
             }
             .tabItem { Label("Home", systemImage: "house.fill") }
 
+            if settings.userRole == .support {
+                NavigationStack {
+                    SupportMapView(settings: settings)
+                        .navigationTitle("Location")
+                        .toolbarBackground(Color.caneNavy, for: .navigationBar)
+                        .toolbarColorScheme(.dark, for: .navigationBar)
+                }
+                .tabItem { Label("Location", systemImage: "map.fill") }
+            }
+
             NavigationStack {
                 SettingsView(settings: settings, auth: auth)
                     .navigationTitle("Settings")
@@ -118,7 +153,10 @@ struct ContentView: View {
             .tabItem { Label("History", systemImage: "clock.fill") }
         }
         .tint(.caneBlue)
-        .onAppear(perform: connectToBackend)
+        .onAppear {
+            connectToBackend()
+            syncLocationSharing()
+        }
         .overlay {
             if let countdown = sosCountdown {
                 SOSCountdownOverlay(countdown: countdown, onCancel: cancelSOS)
@@ -136,6 +174,18 @@ struct ContentView: View {
             Button("OK", role: .cancel) { sosErrorMessage = nil }
         } message: { message in
             Text(message)
+        }
+    }
+
+    /// Publishes live location to Atlas only while a signed-in primary user
+    /// has the sharing toggle on.
+    private func syncLocationSharing() {
+        if auth.isAuthenticated,
+           settings.userRole == .primary,
+           settings.locationSharingEnabled {
+            LocationSharingManager.shared.start()
+        } else {
+            LocationSharingManager.shared.stop()
         }
     }
 
@@ -454,60 +504,145 @@ struct SettingsView: View {
         ZStack {
             Color.caneNavy.ignoresSafeArea()
             List {
+                // MARK: Mode (both roles) — switchable anytime
                 Section {
-                    settingRow(
-                        title: "Haptic Intensity",
-                        hint: "Adjusts vibration strength on the clip module. Currently \(settings.hapticIntensity.label)"
-                    ) {
-                        Picker("Haptic Intensity", selection: $settings.hapticIntensity) {
-                            ForEach(AppSettings.HapticIntensity.allCases) { level in
-                                Text(level.label).tag(level)
-                            }
-                        }
-                        .pickerStyle(.segmented)
-                    }
-                } header: {
-                    sectionHeader(icon: "waveform.path", title: "Vibration")
-                }
-
-                Section {
-                    settingRow(
-                        title: "Detection Sensitivity",
-                        hint: "Controls how aggressively the sensor flags movement. Currently \(settings.sensitivityLevel.label)"
-                    ) {
-                        Picker("Sensitivity", selection: $settings.sensitivityLevel) {
-                            ForEach(AppSettings.SensitivityLevel.allCases) { level in
-                                Text(level.label).tag(level)
-                            }
-                        }
-                        .pickerStyle(.segmented)
-                    }
-                } header: {
-                    sectionHeader(icon: "sensor.tag.radiowaves.forward", title: "Sensor")
-                }
-
-                Section {
-                    Toggle(isOn: $settings.audioEnabled) {
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text("Hazard Narration")
-                                .font(.body.weight(.semibold))
-                                .foregroundColor(.white)
-                            Text("Spoken obstacle descriptions via headphones")
-                                .font(.caption)
-                                .foregroundColor(Color(white: 0.55))
+                    Picker("Mode", selection: Binding(
+                        get: { settings.userRole ?? .primary },
+                        set: { settings.userRole = $0 }
+                    )) {
+                        ForEach(UserRole.allCases) { role in
+                            Text(role.label).tag(role)
                         }
                     }
-                    .tint(.caneBlue)
+                    .pickerStyle(.segmented)
                     .listRowBackground(Color.caneCard)
-                    .accessibilityLabel("Hazard audio narration \(settings.audioEnabled ? "on" : "off")")
-                    .accessibilityHint("Toggles spoken descriptions for detected obstacles")
+                    .accessibilityLabel("App mode: \(settings.userRole?.label ?? "not set")")
+                    .accessibilityHint("Switches between the visually impaired experience and the support partner experience")
                 } header: {
-                    sectionHeader(icon: "speaker.wave.2.fill", title: "Audio")
+                    sectionHeader(icon: "person.crop.rectangle.stack", title: "Mode")
                 }
 
-                // MARK: Account (Auth0 + Atlas sync)
+                if settings.userRole == .primary {
+                    Section {
+                        settingRow(
+                            title: "Haptic Intensity",
+                            hint: "Adjusts vibration strength on the clip module. Currently \(settings.hapticIntensity.label)"
+                        ) {
+                            Picker("Haptic Intensity", selection: $settings.hapticIntensity) {
+                                ForEach(AppSettings.HapticIntensity.allCases) { level in
+                                    Text(level.label).tag(level)
+                                }
+                            }
+                            .pickerStyle(.segmented)
+                        }
+                    } header: {
+                        sectionHeader(icon: "waveform.path", title: "Vibration")
+                    }
+
+                    Section {
+                        settingRow(
+                            title: "Detection Sensitivity",
+                            hint: "Controls how aggressively the sensor flags movement. Currently \(settings.sensitivityLevel.label)"
+                        ) {
+                            Picker("Sensitivity", selection: $settings.sensitivityLevel) {
+                                ForEach(AppSettings.SensitivityLevel.allCases) { level in
+                                    Text(level.label).tag(level)
+                                }
+                            }
+                            .pickerStyle(.segmented)
+                        }
+                    } header: {
+                        sectionHeader(icon: "sensor.tag.radiowaves.forward", title: "Sensor")
+                    }
+
+                    Section {
+                        Toggle(isOn: $settings.audioEnabled) {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("Hazard Narration")
+                                    .font(.body.weight(.semibold))
+                                    .foregroundColor(.white)
+                                Text("Spoken obstacle descriptions via headphones")
+                                    .font(.caption)
+                                    .foregroundColor(Color(white: 0.55))
+                            }
+                        }
+                        .tint(.caneBlue)
+                        .listRowBackground(Color.caneCard)
+                        .accessibilityLabel("Hazard audio narration \(settings.audioEnabled ? "on" : "off")")
+                        .accessibilityHint("Toggles spoken descriptions for detected obstacles")
+                    } header: {
+                        sectionHeader(icon: "speaker.wave.2.fill", title: "Audio")
+                    }
+
+                    // MARK: Location sharing (primary role only)
+                    Section {
+                        Toggle(isOn: $settings.locationSharingEnabled) {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("Share Live Location")
+                                    .font(.body.weight(.semibold))
+                                    .foregroundColor(.white)
+                                Text("Lets your support partner see where you are on their map")
+                                    .font(.caption)
+                                    .foregroundColor(Color(white: 0.55))
+                            }
+                        }
+                        .tint(.caneBlue)
+                        .listRowBackground(Color.caneCard)
+                        .accessibilityLabel("Live location sharing \(settings.locationSharingEnabled ? "on" : "off")")
+                        .accessibilityHint("When on, your support partner can follow your location on a map. Turn off anytime.")
+
+                        HStack {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("Your share code")
+                                    .font(.body.weight(.semibold))
+                                    .foregroundColor(.white)
+                                Text("Your support partner enters this in their app")
+                                    .font(.caption)
+                                    .foregroundColor(Color(white: 0.55))
+                            }
+                            Spacer()
+                            Text(settings.shareCode)
+                                .font(.system(size: 20, weight: .bold, design: .monospaced))
+                                .foregroundColor(.caneBlue)
+                                .textSelection(.enabled)
+                        }
+                        .listRowBackground(Color.caneCard)
+                        .accessibilityElement(children: .combine)
+                        .accessibilityLabel("Your share code is \(settings.shareCode.map(String.init).joined(separator: " "))")
+                    } header: {
+                        sectionHeader(icon: "location.fill", title: "Location Sharing")
+                    }
+                }
+
+                if settings.userRole == .support {
+                    Section {
+                        HStack {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("Following code")
+                                    .font(.body.weight(.semibold))
+                                    .foregroundColor(.white)
+                                Text("Set or change it from the Location tab")
+                                    .font(.caption)
+                                    .foregroundColor(Color(white: 0.55))
+                            }
+                            Spacer()
+                            Text(settings.followCode.isEmpty ? "—" : settings.followCode)
+                                .font(.system(size: 20, weight: .bold, design: .monospaced))
+                                .foregroundColor(settings.followCode.isEmpty ? Color(white: 0.40) : .caneBlue)
+                        }
+                        .listRowBackground(Color.caneCard)
+                        .accessibilityElement(children: .combine)
+                        .accessibilityLabel(settings.followCode.isEmpty
+                            ? "Not following anyone yet. Set a share code from the Location tab."
+                            : "Following share code \(settings.followCode.map(String.init).joined(separator: " "))")
+                    } header: {
+                        sectionHeader(icon: "map.fill", title: "Following")
+                    }
+                }
+
+                // MARK: Account (profile + Atlas sync; sign-in itself
+                // happens on the launch screen, before the app is shown)
                 Section {
-                    if auth.isAuthenticated {
                         HStack(spacing: 12) {
                             if let picture = auth.userPicture {
                                 AsyncImage(url: picture) { image in
@@ -564,32 +699,6 @@ struct SettingsView: View {
                                 .font(.body.weight(.semibold))
                         }
                         .listRowBackground(Color.caneCard)
-                    } else {
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text("Sign in to sync your contacts and settings across devices.")
-                                .font(.caption)
-                                .foregroundColor(Color(white: 0.55))
-                        }
-                        .listRowBackground(Color.caneCard)
-
-                        Button {
-                            Task { await auth.login() }
-                        } label: {
-                            HStack {
-                                Spacer()
-                                if auth.isSyncing {
-                                    ProgressView().tint(.white)
-                                }
-                                Text(auth.isSyncing ? "Signing in…" : "Sign in with Auth0")
-                                    .font(.body.weight(.semibold))
-                                    .foregroundColor(.white)
-                                Spacer()
-                            }
-                        }
-                        .disabled(auth.isSyncing)
-                        .listRowBackground(auth.isSyncing ? Color(white: 0.18) : Color.caneBlue)
-                        .accessibilityLabel("Sign in with Auth0")
-                    }
                 } header: {
                     sectionHeader(icon: "person.crop.circle.fill", title: "Account")
                 }
