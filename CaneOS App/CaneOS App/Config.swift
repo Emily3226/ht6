@@ -15,11 +15,11 @@ enum Config {
     // Python pipeline server (backend/pipeline, `python -m pipeline.main`).
     // IP = the Mac running the server (it prints this on startup); port 8765
     // is the server's DEFAULT_PORT. Phone and Mac must be on the same network.
-    static let hapticsWebSocketURL = "ws://172.20.10.14:8765/ws/haptics"
-    static let hazardsWebSocketURL = "ws://172.20.10.14:8765/ws/hazards"
-    static let statusWebSocketURL  = "ws://172.20.10.14:8765/ws/status"
+    static let hapticsWebSocketURL = "ws://172.20.10.5:8765/ws/haptics"
+    static let hazardsWebSocketURL = "ws://172.20.10.5:8765/ws/hazards"
+    static let statusWebSocketURL  = "ws://172.20.10.5:8765/ws/status"
     // Same server, HTTP side — used by the Settings "simulate event" button.
-    static let pipelineBaseURL     = "http://172.20.10.14:8765"
+    static let pipelineBaseURL     = "http://172.20.10.5:8765"
 
     // MARK: - MongoDB Atlas (via our Vercel proxy)
     // MongoDB sunset the hosted Atlas Data API, so backend/api/db.js (deployed

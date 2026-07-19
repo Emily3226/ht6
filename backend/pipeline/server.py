@@ -46,6 +46,15 @@ async def lifespan(app: FastAPI):
     # haptic loop run concurrently and neither can block the other.
     startup_hooks = getattr(app.state, "on_startup_tasks", None) or []
     tasks = [asyncio.create_task(hook()) for hook in startup_hooks]
+    # A crashed background task otherwise dies silently (its exception is
+    # only surfaced if something awaits it, and nothing does) -- log it
+    # loudly so a dead haptic/pipeline/status loop is visible in the
+    # server terminal instead of just "haptics stopped working."
+    def _log_crash(task: asyncio.Task) -> None:
+        if not task.cancelled() and task.exception() is not None:
+            logger.error("Background task crashed", exc_info=task.exception())
+    for task in tasks:
+        task.add_done_callback(_log_crash)
     try:
         yield
     finally:

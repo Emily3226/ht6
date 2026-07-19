@@ -62,24 +62,31 @@ async def run_haptic_loop(poll_interval_s: float = DEFAULT_POLL_INTERVAL_S) -> N
     # last cycle).
     triggered: list = []
     while True:
-        # read_all_tof() is a real (blocking, HTTP) hardware call wrapped
-        # in asyncio.to_thread() internally -- awaiting it here is safe
-        # and doesn't block this loop's own scheduling, or anything else
-        # on the event loop.
-        distances = await tof_input.read_all_tof()
-        triggered = check_thresholds(distances, triggered)
+        # One bad cycle must never kill the loop: this task runs
+        # unsupervised (create_task in the lifespan hook), so an uncaught
+        # exception here doesn't crash the server -- it just silently
+        # stops all haptics forever while everything else keeps working.
+        try:
+            # read_all_tof() is a real (blocking, HTTP) hardware call wrapped
+            # in asyncio.to_thread() internally -- awaiting it here is safe
+            # and doesn't block this loop's own scheduling, or anything else
+            # on the event loop.
+            distances = await tof_input.read_all_tof()
+            triggered = check_thresholds(distances, triggered)
 
-        for direction in triggered:
-            if direction == "up":
-                # Unrelated to haptic pacing -- narration for overhead
-                # hazards has its own, separate throttle downstream in
-                # narration_worker.py, so this still fires every cycle
-                # "up" is triggered, regardless of what the arbiter
-                # decides for /ws/haptics below.
-                narration_queue.push_nowait({"source": "tof_up", "distance_m": distances["up"]})
+            for direction in triggered:
+                if direction == "up":
+                    # Unrelated to haptic pacing -- narration for overhead
+                    # hazards has its own, separate throttle downstream in
+                    # narration_worker.py, so this still fires every cycle
+                    # "up" is triggered, regardless of what the arbiter
+                    # decides for /ws/haptics below.
+                    narration_queue.push_nowait({"source": "tof_up", "distance_m": distances["up"]})
 
-        direction_to_broadcast = arbiter.resolve(distances, triggered, time.monotonic())
-        if direction_to_broadcast is not None:
-            await broadcast_haptic(direction_to_broadcast)
+            direction_to_broadcast = arbiter.resolve(distances, triggered, time.monotonic())
+            if direction_to_broadcast is not None:
+                await broadcast_haptic(direction_to_broadcast)
+        except Exception:
+            logger.exception("Haptic loop cycle failed; continuing")
 
         await asyncio.sleep(poll_interval_s)

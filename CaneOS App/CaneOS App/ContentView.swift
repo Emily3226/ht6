@@ -68,6 +68,9 @@ struct ContentView: View {
     @State private var isHardwareConnected = false
     @State private var sosErrorMessage: String?
     @State private var autoSOSTask: Task<Void, Never>?
+    @State private var activeBuzz: HapticSensorDirection?
+    @State private var buzzClearTask: Task<Void, Never>?
+    @State private var lastAutoSOSAt: Date?
     @State private var smsCompose: SMSCompose?
 
     @StateObject private var voice = VoiceAssistantManager()
@@ -126,6 +129,7 @@ struct ContentView: View {
                 HomeView(
                     isConnected: isHardwareConnected,
                     isWatchConnected: phoneSession.isWatchConnected,
+                    activeBuzz: activeBuzz,
                     lastHazard: lastHazard,
                     cameraStatus: cameraStatus,
                     voice: voice,
@@ -167,6 +171,7 @@ struct ContentView: View {
                     onScan: { requestSceneDescription() },
                     onTestHaptic: { direction in
                         phoneSession.sendHaptic(direction)
+                        showBuzz(direction)
                         // Spoken cue alongside the buzz — also doubles as a
                         // live test of the ElevenLabs → playback pipeline.
                         Task { await speakAndPlay(direction.rawValue.capitalized) }
@@ -253,6 +258,7 @@ struct ContentView: View {
         // between the sensor firing on the backend and the Watch buzzing.
         hapticsConnection.onMessage = { message in
             phoneSession.sendHaptic(message.direction)
+            showBuzz(message.direction)
         }
         hapticsConnection.connect(to: Config.hapticsWebSocketURL)
 
@@ -356,6 +362,20 @@ struct ContentView: View {
         voice.cancelAll()
     }
 
+    /// Flashes the Home tab's haptic indicator to mirror the buzz being sent
+    /// to the watch, so haptics are visible on screen (sighted teammates,
+    /// judges, and debugging when the watch is off-wrist). Holds ~1.8s to
+    /// roughly match the Taptic Engine's actual buzz duration.
+    private func showBuzz(_ direction: HapticSensorDirection) {
+        buzzClearTask?.cancel()
+        withAnimation(.spring(duration: 0.25)) { activeBuzz = direction }
+        buzzClearTask = Task {
+            try? await Task.sleep(for: .seconds(1.8))
+            guard !Task.isCancelled else { return }
+            withAnimation(.easeOut(duration: 0.5)) { activeBuzz = nil }
+        }
+    }
+
     /// Mirrors the assistant state to the Watch so its UI matches the phone.
     private func pushVoiceStateToWatch() {
         let stateName: String
@@ -393,7 +413,9 @@ struct ContentView: View {
         // and haptic. The watch overlay is a 5-second cancel window; the
         // phone runs the authoritative timer and sends the real SOS (SMS +
         // email gateway) unless the watch cancels in time.
-        if hazard.urgency == "urgent" {
+        // The 2-minute cooldown gates the overlay too — showing a countdown
+        // whose SOS is cooldown-suppressed would be a lie.
+        if hazard.urgency == "urgent" && autoSOSAvailable {
             phoneSession.sendSOSAlert()
             scheduleAutoSOS()
         }
@@ -433,12 +455,23 @@ struct ContentView: View {
     /// (plus 1s of slack so a last-instant cancel tap wins the race), then
     /// fires the real SOS. The watch's cancel button lands in cancelAutoSOS()
     /// via PhoneSessionManager.onSOSCancel.
+    /// At most one auto-SOS per 2 minutes: a burst of urgent
+    /// classifications (e.g. sensors blocked on a table during setup)
+    /// must not text the emergency contacts once per detection. The
+    /// manual hold button deliberately bypasses this.
+    private var autoSOSAvailable: Bool {
+        guard let last = lastAutoSOSAt else { return true }
+        return Date().timeIntervalSince(last) >= 120
+    }
+
     private func scheduleAutoSOS() {
+        guard autoSOSAvailable else { return }
         autoSOSTask?.cancel()
         autoSOSTask = Task {
             try? await Task.sleep(for: .seconds(6))
             guard !Task.isCancelled else { return }
             autoSOSTask = nil
+            lastAutoSOSAt = Date()
             await fireSOS(auto: true)
         }
     }
@@ -577,6 +610,7 @@ struct ContentView: View {
 struct HomeView: View {
     let isConnected: Bool
     let isWatchConnected: Bool
+    let activeBuzz: HapticSensorDirection?
     let lastHazard: HazardMessage?
     let cameraStatus: CameraStatusEvent?
     @ObservedObject var voice: VoiceAssistantManager
@@ -591,6 +625,7 @@ struct HomeView: View {
             ScrollView {
                 VStack(spacing: 20) {
                     statusCard
+                    hapticCard
                     voiceCard
                     watchPill
                     if cameraStatus == .cameraOffline { cameraOfflinePill }
@@ -744,6 +779,69 @@ struct HomeView: View {
         .accessibilityLabel(isConnected
             ? "System connected and active"
             : "Hardware disconnected, system offline")
+    }
+
+    // MARK: Haptic indicator
+
+    /// On-screen mirror of the haptic reflex path: the three sensor
+    /// directions, with the one currently buzzing lit up and pulsing.
+    /// Exists so haptics are demoable/debuggable visually — the buzz
+    /// itself is only feelable on the watch.
+    private var hapticCard: some View {
+        VStack(spacing: 14) {
+            HStack(spacing: 6) {
+                Image(systemName: "hand.tap.fill")
+                    .foregroundColor(.caneBlue)
+                Text("Haptic Feedback")
+                    .font(.caption.bold())
+                    .foregroundColor(.caneBlue)
+                    .tracking(0.5)
+                Spacer()
+                Text(activeBuzz == nil ? "Monitoring" : "BUZZING \(activeBuzz!.rawValue.uppercased())")
+                    .font(.caption.bold())
+                    .foregroundColor(activeBuzz == nil ? Color(white: 0.50) : .caneRed)
+            }
+            HStack(spacing: 12) {
+                buzzIndicator(.left,  symbol: "arrow.left.circle.fill",  label: "Left")
+                buzzIndicator(.up,    symbol: "arrow.up.circle.fill",    label: "Overhead")
+                buzzIndicator(.right, symbol: "arrow.right.circle.fill", label: "Right")
+            }
+        }
+        .padding(18)
+        .background(Color.caneCard)
+        .cornerRadius(20)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(activeBuzz == nil
+            ? "Haptic feedback: monitoring, no active buzz"
+            : "Haptic feedback: buzzing \(activeBuzz!.rawValue)")
+    }
+
+    private func buzzIndicator(_ direction: HapticSensorDirection,
+                               symbol: String, label: String) -> some View {
+        let isActive = activeBuzz == direction
+        return VStack(spacing: 6) {
+            ZStack {
+                if isActive {
+                    Circle()
+                        .stroke(Color.caneRed.opacity(0.5), lineWidth: 3)
+                        .frame(width: 58, height: 58)
+                        .scaleEffect(isActive ? 1.25 : 1.0)
+                        .opacity(isActive ? 0 : 1)
+                        .animation(.easeOut(duration: 0.8).repeatForever(autoreverses: false),
+                                   value: isActive)
+                }
+                Image(systemName: symbol)
+                    .font(.system(size: 44, weight: .semibold))
+                    .foregroundColor(isActive ? .caneRed : Color(white: 0.30))
+                    .scaleEffect(isActive ? 1.15 : 1.0)
+                    .shadow(color: isActive ? Color.caneRed.opacity(0.7) : .clear, radius: 10)
+            }
+            .frame(width: 60, height: 60)
+            Text(label)
+                .font(.caption2.weight(isActive ? .bold : .regular))
+                .foregroundColor(isActive ? .white : Color(white: 0.45))
+        }
+        .frame(maxWidth: .infinity)
     }
 
     private var watchPill: some View {

@@ -50,7 +50,19 @@ def _read_all_tof_sync() -> dict:
     None values.
     """
     try:
-        return _session.get(f"http://{BOARD_IP}:8080/tof", timeout=0.5).json()
+        data = _session.get(f"http://{BOARD_IP}:8080/tof", timeout=0.5).json()
+        # Sanitize: only the three known directions, only numeric values.
+        # A malformed/partial response (error JSON, string values, extra
+        # keys) must degrade to None readings, never leak junk downstream
+        # -- one bad value reaching check_thresholds() raises and silently
+        # kills the whole haptic loop task for good.
+        return {
+            direction: (float(data[direction])
+                        if isinstance(data.get(direction), (int, float))
+                        and not isinstance(data.get(direction), bool)
+                        else None)
+            for direction in ("left", "right", "up")
+        }
     except Exception:
         return {"left": None, "right": None, "up": None}
 
