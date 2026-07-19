@@ -1832,6 +1832,7 @@ struct HistoryView: View {
     @ObservedObject private var auth = AuthManager.shared
     @Environment(\.openURL) private var openURL
     @State private var insights: IncidentStore.Insights?
+    @State private var showClearConfirm = false
 
     private static let formatter: DateFormatter = {
         let f = DateFormatter()
@@ -1885,6 +1886,25 @@ struct HistoryView: View {
                         .accessibilityLabel("Edit incident history")
                 }
             }
+            ToolbarItem(placement: .navigationBarTrailing) {
+                if !store.incidents.isEmpty {
+                    Button { showClearConfirm = true } label: {
+                        Image(systemName: "trash")
+                            .foregroundColor(.red)
+                    }
+                    .accessibilityLabel("Clear all incidents")
+                }
+            }
+        }
+        .confirmationDialog(
+            "Delete all \(store.incidents.count) incidents? This also removes them from the cloud.",
+            isPresented: $showClearConfirm,
+            titleVisibility: .visible
+        ) {
+            Button("Delete All", role: .destructive) {
+                Task { await store.clearAll() }
+            }
+            Button("Cancel", role: .cancel) {}
         }
     }
 

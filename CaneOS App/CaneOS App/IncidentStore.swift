@@ -15,6 +15,12 @@ struct Incident: Identifiable, Codable {
     /// and older saved incidents predate this field.
     var latitude: Double?
     var longitude: Double?
+    /// Whether this incident is known to have reached Atlas. Distinguishes
+    /// "never uploaded, should backfill" from "was in the cloud and has
+    /// since been deleted there, should delete locally too" during
+    /// pullFromAtlas(). Optional so incidents saved before this field
+    /// existed still decode (nil == treat as never synced).
+    var synced: Bool? = nil
 
     var hasLocation: Bool { latitude != nil && longitude != nil }
 
@@ -52,10 +58,14 @@ final class IncidentStore: ObservableObject {
         }
         Task { @MainActor in
             guard let uid = AuthManager.shared.userId else { return }
-            try? await AtlasClient.shared.insertOne(
+            guard (try? await AtlasClient.shared.insertOne(
                 collection: "incidents",
                 document: incident.atlasDoc(userId: uid)
-            )
+            )) != nil else { return }
+            if let index = incidents.firstIndex(where: { $0.id == incident.id }) {
+                incidents[index].synced = true
+                save()
+            }
         }
         return incident.id
     }
@@ -90,6 +100,21 @@ final class IncidentStore: ObservableObject {
                 )
             }
         }
+    }
+
+    /// Wipes the entire incident history: MongoDB first (one deleteMany),
+    /// then local. Cloud-first ordering matters — the History tab re-syncs
+    /// whenever the list changes, so clearing locally before the cloud
+    /// delete lands would just pull everything straight back down.
+    @MainActor
+    func clearAll() async {
+        if let uid = AuthManager.shared.userId {
+            try? await AtlasClient.shared.deleteMany(
+                collection: "incidents", filter: ["userId": uid]
+            )
+        }
+        incidents.removeAll()
+        save()
     }
 
     // MARK: - Atlas sync
@@ -180,24 +205,39 @@ final class IncidentStore: ObservableObject {
                 sort: ["date": -1]
             )
 
-            // Two-way sync. Backfill: local incidents that never reached
-            // Atlas (logged before signing in, or while offline) get pushed
-            // up, so cloud aggregations (the Insights card) count the same
-            // incidents the History list shows.
+            // Two-way sync, with the synced flag deciding which way a
+            // local-only incident goes:
+            //
+            // Backfill: local incidents that never reached Atlas (logged
+            // before signing in, or while offline) get pushed up, so cloud
+            // aggregations (the Insights card) count the same incidents the
+            // History list shows.
+            //
+            // Remote deletes: an incident that DID reach Atlas but is no
+            // longer there was deleted remotely (e.g. straight in the
+            // MongoDB UI) — mirror the delete locally instead of endlessly
+            // re-uploading it.
             let cloudIds = Set(docs.compactMap { $0["id"] as? String })
-            let localOnly = incidents.filter { !cloudIds.contains($0.id.uuidString) }
+            let localOnly = incidents.filter {
+                !cloudIds.contains($0.id.uuidString) && !($0.synced ?? false)
+            }
             if !localOnly.isEmpty {
                 try? await AtlasClient.shared.insertMany(
                     collection: "incidents",
                     documents: localOnly.map { $0.atlasDoc(userId: userId) }
                 )
             }
+            incidents.removeAll {
+                ($0.synced ?? false) && !cloudIds.contains($0.id.uuidString)
+            }
 
             let fetched = docs.compactMap { Incident(atlasDoc: $0) }
             let existingIds = Set(incidents.map(\.id))
             let newOnes = fetched.filter { !existingIds.contains($0.id) }
-            guard !newOnes.isEmpty else { return }
             incidents = (incidents + newOnes).sorted { $0.date > $1.date }
+            // Everything left either came from the cloud or was just pushed
+            // there — mark it all synced so future remote deletes stick.
+            for index in incidents.indices { incidents[index].synced = true }
             save()
         } catch {
             print("[Atlas] pullIncidents error: \(error.localizedDescription)")
