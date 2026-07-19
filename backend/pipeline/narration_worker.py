@@ -50,7 +50,17 @@ async def _handle_event(event: dict, throttle: HazardThrottle) -> None:
         detection = event["detection"]
         if not throttle.should_narrate(detection):
             return
-        hazard = await analyze_hazard(event["frame"], detection)
+        # Defense in depth: main.py's run_pipeline() already skips pushing
+        # a camera event onto narration_queue at all when capture_frame()
+        # returns None (frame capture failed), so this should never
+        # actually trigger today -- but if any future caller ever pushes a
+        # frameless camera event here, a bad/empty image must never reach
+        # Gemini or produce a broadcast based on nothing.
+        frame = event["frame"]
+        if frame is None:
+            logger.warning("Camera event has no frame, skipping narration: %s", detection)
+            return
+        hazard = await analyze_hazard(frame, detection)
 
     elif source == "tof_up":
         # No camera detection exists for this origin -- build a stable

@@ -2,8 +2,13 @@
 
 Four independent background tasks, all wired up in `pipeline/main.py`:
 
-- **Camera detection path** (`run_pipeline`): camera detection -> ToF
-  distance lookup -> filter -> pushes onto a shared narration queue.
+- **Camera detection path** (`run_pipeline`): real camera detection events
+  (added 2026-07-19, see "Real camera detection events" below) -> ToF
+  distance lookup -> filter -> real frame capture over HTTP (added
+  2026-07-19, see "Real camera frame capture" below) -> pushes onto a
+  shared narration queue. A capture failure (board unreachable, bad
+  response) skips the push for that detection entirely rather than
+  narrating a placeholder.
 - **Haptic reflex path** (`run_haptic_loop`): ToF sensors -> threshold
   check -> immediate, unthrottled direction broadcast over `/ws/haptics`
   -- and, for overhead ("up") triggers only, *also* a fire-and-forget push
@@ -26,60 +31,67 @@ handled inline in the same connection's receive loop.
 Pipeline stages (see `pipeline/`):
 
 1. **detection_input.py** -- filters raw detections (`should_escalate`),
-   attaches ToF-sourced distance (`attach_distance`), and provides the mock
-   detection/frame sources for now.
-2. **tof_input.py** -- real ToF (time-of-flight) hardware reads for three
+   attaches ToF-sourced distance (`attach_distance`), and captures the
+   current camera frame over HTTP (`capture_frame()`, added 2026-07-19,
+   see "Real camera frame capture" below). `mock_detection_stream()` and
+   `mock_capture_frame()` are both kept for `--simulate-crash` and
+   hardware-less dev.
+2. **camera_events.py** -- real camera detection events over UDP, added
+   2026-07-19 (see "Real camera detection events" below); bridges a
+   teammate's thread-driven `listen_events()` into the asyncio pipeline
+   via `CameraEventBridge`.
+3. **tof_input.py** -- real ToF (time-of-flight) hardware reads for three
    units (left/right/up), added 2026-07-19 (see "Real ToF hardware" below);
    the single interface to ToF hardware, called by both paths. The
    original mock is kept alongside as `mock_read_all_tof()` for tests and
    hardware-less development.
-3. **narration_queue.py** -- the shared queue where camera-originated and
+4. **narration_queue.py** -- the shared queue where camera-originated and
    overhead-ToF-originated events both land, consumed by
    `narration_worker.py`. `push_nowait()` never blocks and never raises.
-4. **throttle.py** -- `HazardThrottle`: dedups an ongoing hazard, holds off
+5. **throttle.py** -- `HazardThrottle`: dedups an ongoing hazard, holds off
    re-narrating it for a cooldown window, bypasses that cooldown on genuinely
    new information (signature change or sharp worsening), and enforces a
    hard rate cap as a safety net for chaotic scenes. One shared instance is
    used for both narration origins.
-5. **gemini_stage.py** -- sends the frame + detection to Gemini
+6. **gemini_stage.py** -- sends the frame + detection to Gemini
    (`gemini-3.5-flash`) and parses the structured hazard JSON. Never called
    for overhead hazards (see below). Also holds `answer_query()`, a
    separate open-ended-question prompt/flow for "Hey Cane" (see below) --
    a different prompt and no JSON mode, but the same client/model and
    retry-then-fallback pattern as `analyze_hazard()`. Called from
    `server.py`'s `/ws/hazards` handler, not from a REST endpoint.
-6. **narration_templates.py** -- fixed spoken-description templates for
+7. **narration_templates.py** -- fixed spoken-description templates for
    overhead hazards, picked by distance, no Gemini call involved.
-7. **narration_worker.py** -- consumes `narration_queue`, runs the shared
+8. **narration_worker.py** -- consumes `narration_queue`, runs the shared
    throttle, calls `gemini_stage` or `narration_templates` depending on
    event source, and broadcasts the result.
-8. **haptic_trigger.py** -- `check_thresholds()`: which ToF directions
+9. **haptic_trigger.py** -- `check_thresholds()`: which ToF directions
    currently read too close, with hysteresis (two thresholds, not a time
    delay) so sensor jitter around one distance can't flip a direction's
    state every poll cycle.
-9. **haptic_loop.py** -- tight, independent polling loop driving the haptic
-   reflex path; never imports `throttle.py` or `gemini_stage.py` (the
-   narration_queue push for "up" triggers is fire-and-forget and adds no
-   dependency on either).
-10. **server.py** -- FastAPI app: `GET /health`, `WS /ws/hazards`
+10. **haptic_loop.py** -- tight, independent polling loop driving the haptic
+    reflex path; never imports `throttle.py` or `gemini_stage.py` (the
+    narration_queue push for "up" triggers is fire-and-forget and adds no
+    dependency on either).
+11. **server.py** -- FastAPI app: `GET /health`, `WS /ws/hazards`
     (bidirectional -- broadcasts ambient hazards AND receives/answers
     on-demand voice questions), `WS /ws/haptics`, `WS /ws/status` -- each
     connection type with its own `ConnectionManager`, which now also holds
     a per-connection send lock (see "On-demand Q&A" below for why).
-11. **heartbeat_input.py** -- mock periodic camera heartbeat, independent
+12. **heartbeat_input.py** -- mock periodic camera heartbeat, independent
     of detection events; the integration point for the real hardware
     heartbeat feed.
-12. **camera_watchdog.py** -- `CameraWatchdog`: turns heartbeat activity
+13. **camera_watchdog.py** -- `CameraWatchdog`: turns heartbeat activity
     (or silence) into online/offline transitions, firing an event only
     when the state actually changes.
-13. **status_loop.py** -- consumes the heartbeat stream and independently
+14. **status_loop.py** -- consumes the heartbeat stream and independently
     polls for timeout, both driving one `CameraWatchdog`; never imports
     `throttle.py`, `gemini_stage.py`, `narration_queue.py`, `haptic_loop.py`,
     or `haptic_arbiter.py`.
-14. **conversation_memory.py** -- MongoDB-backed conversation history for
+15. **conversation_memory.py** -- MongoDB-backed conversation history for
     the "Hey Cane" on-demand Q&A feature (see below); the only module that
     talks to Mongo.
-15. **main.py** -- wires all four background tasks together (the voice
+16. **main.py** -- wires all four background tasks together (the voice
     query path needs no task of its own -- it's handled inline in
     `/ws/hazards`'s existing receive loop).
 
@@ -423,8 +435,8 @@ injected multi-object chaos.
 ## Distance now comes from ToF, not the camera
 
 The OAK-1-AF camera has no depth perception, so a raw detection no longer
-carries `distance_m` at all -- `mock_detection_stream()` (and the real
-camera feed, eventually) only yields
+carries `distance_m` at all -- both `mock_detection_stream()` and the real
+camera feed (`camera_events.py`, added 2026-07-19) only yield
 `{timestamp, object_class, direction, confidence}`. `distance_m` is
 attached separately, at detection-time, by `detection_input.attach_distance()`,
 which looks up the current ToF reading for that detection's direction
@@ -486,7 +498,11 @@ demo endpoint and `tof_input.force_dip()` only manipulate
 the real `read_all_tof()` instead, `/simulate/tof` no longer has any
 effect on live haptic/narration behavior -- it wasn't touched in this
 change (out of scope), but be aware it's now a no-op for its original
-purpose until/unless that endpoint is updated separately.
+purpose until/unless that endpoint is updated separately. (Its call to
+`capture_frame()` *was* touched during the 2026-07-19 frame-capture work,
+purely to keep it from crashing now that `capture_frame()` is `async def`
+-- see "Real camera frame capture" below -- it still doesn't drive real
+ToF behavior.)
 
 **Manual test path**: with `BOARD_IP` reachable (on her hotspot), run the
 server and `test_haptic_client.py` as usual -- you should see real
@@ -497,26 +513,126 @@ else. If the board is unreachable entirely, every reading will be `None`
 (her code's own fallback) -- confirm haptics simply stay quiet rather than
 erroring.
 
-## Camera integration (still mocked -- out of scope for the ToF work above)
+## Real camera detection events (added 2026-07-19)
 
-- **Real camera detection feed**: `pipeline/detection_input.py`, replace
-  `mock_detection_stream()` with a generator/async-generator from the real
-  OAK-1-AF pipeline (`listen_events()`, being built separately), yielding
-  dicts shaped `{timestamp, object_class, direction, confidence}` (no
-  distance -- see above). Wire it into `pipeline/main.py`'s
-  `run_pipeline()` in place of the mock stream.
-- **Real camera frame**: `pipeline/detection_input.py`, replace
-  `capture_frame()` with the real frame grab; keep the `-> bytes` (JPEG)
-  signature so nothing downstream needs to change.
+`pipeline/camera_events.py`'s `listen_events()` is a teammate's code,
+integrated unmodified: a daemon thread listening for detection events over
+UDP on `EVENT_PORT` (5005, same board as ToF's `BOARD_IP`, `172.20.10.2`,
+different port), calling a callback once per event --
+`{"timestamp": ..., "object_class": ..., "direction": ..., "confidence": ...}`.
 
-Neither of these was touched by the 2026-07-19 ToF integration --
-`mock_detection_stream()`, `capture_frame()`, and `main.py`'s camera
-wiring are all intentionally untouched and still mock-driven, pending the
-teammate's separate camera integration work. `attach_distance()` (which
-sits between the two, mapping a camera detection's direction to a ToF
-reading) was updated for None-safety on the ToF side only, since it calls
-`tof_input.read_all_tof()` directly -- it does not otherwise assume
-anything about where the detection came from.
+**The thread-to-asyncio bridge**: her callback fires on her own background
+thread, not the event loop's thread. `asyncio.Queue` isn't thread-safe, so
+`CameraEventBridge` can't just push into it directly from that callback --
+`_on_event()` validates the event, then hands the actual queue push to the
+event loop via `loop.call_soon_threadsafe()`, which is exactly what
+that API exists for (scheduling a callback to run safely on the loop's own
+thread, callable from any other thread). This is a different problem than
+`tof_input.py`'s `asyncio.to_thread()` wrapping -- that's a one-shot
+blocking call wrapped fresh per poll; this is a long-lived background
+thread pushing events whenever they arrive, so the bridge is a persistent
+queue fed via `call_soon_threadsafe()`, not a per-call wrapper.
+`tests/test_camera_events.py` proves the cross-thread handoff with a real
+`threading.Thread`, not just a same-thread call.
+
+**Defensive validation**: `is_valid_detection()` checks all four expected
+keys are present and `direction` is one of `left`/`center`/`right` *before*
+anything is queued -- a malformed event (missing key, garbage direction,
+non-dict payload) is logged and dropped, never reaching
+`attach_distance()`/`should_escalate()`, which assume well-formed input and
+would otherwise crash on it.
+
+**`mock_detection_stream()` is kept, not deleted** -- it's still the
+active source when `--simulate-crash`/`SIMULATE_CRASH` is set, so
+`HazardThrottle`'s chaotic-scene cooldown/rate-cap behavior can still be
+demoed/verified on demand without needing the real hardware to misbehave
+on cue (same reasoning `tof_input.mock_read_all_tof()` is kept for). By
+default (no `--simulate-crash`), `CameraEventBridge` is the active source.
+
+**Manual test path**: with her camera process running and reachable, run
+the server (no flags) and watch `test_client.py` on `/ws/hazards` -- real
+detection events should now flow through `attach_distance()` ->
+`should_escalate()` -> `capture_frame()` -> `narration_queue`, ending in a
+real Gemini call analyzing both real detection metadata and a real camera
+frame (see "Real camera frame capture" below).
+
+Without her hardware physically present, you can still exercise the real
+UDP path end-to-end (not just the unit tests) by sending a packet shaped
+like her event from a second terminal:
+
+```python
+import socket, json, time
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+event = {"timestamp": time.time(), "object_class": "person", "direction": "center", "confidence": 0.92}
+s.sendto(json.dumps(event).encode(), ("127.0.0.1", 5005))
+```
+
+This is genuinely useful, not just a formality -- it's how the 2026-07-19
+integration itself was verified live in an environment where neither her
+ToF board nor her camera board was reachable: the packet arrives over a
+real socket, gets validated and queued by `CameraEventBridge`, then (with
+the ToF board unreachable, so distance comes back `None`) correctly falls
+through `should_escalate()` without escalating -- no crash, no spurious
+broadcast, confirming the whole chain rather than just each piece in
+isolation. With a reachable ToF board giving a real close-enough reading,
+the same packet would carry all the way through to a real Gemini call and
+an actual `/ws/hazards` broadcast.
+
+## Real camera frame capture (added 2026-07-19)
+
+`pipeline/detection_input.py`'s `capture_frame()` is now a real HTTP grab
+from a teammate's camera board, not the solid-color Pillow placeholder:
+`requests.Session().get(f"http://{BOARD_IP}:{FRAME_PORT}/frame",
+timeout=FRAME_TIMEOUT_S).content`, returning raw JPEG bytes.
+`BOARD_IP` (`172.20.10.2`) is the same physical board as ToF and the UDP
+detection events, just a different port (`FRAME_PORT = 8090`) -- hardcoded
+the same way, for the same reason: it's tied to specific hardware on her
+hotspot, not per-deployment config. `FRAME_TIMEOUT_S` is `3.0`.
+
+**Async wrapping**: same pattern as `tof_input.read_all_tof()` -- the HTTP
+GET is a blocking synchronous call, so `capture_frame()` is `async def`,
+wrapping the blocking grab in `asyncio.to_thread()` so it never freezes
+the event loop while waiting on the board.
+
+**None on any failure**: `capture_frame()` returns `None` (never raises)
+if the request times out, the connection fails, the response status isn't
+200, the body is empty, or the bytes don't decode as a valid image
+(checked via `PIL.Image.verify()`). Callers must treat `None` as "no
+frame available this cycle," not an error to propagate.
+
+**Every call site now awaits and handles `None`** -- there were three,
+not the one originally assumed:
+- `main.py`'s `_process_detection()`: the actual capture point in the live
+  pipeline. A `None` frame logs a warning and skips pushing that
+  detection onto `narration_queue` entirely -- no Gemini call, no
+  narration, no broadcast, but processing continues normally for the next
+  detection.
+- `narration_worker.py`'s camera-event branch: a defensive second check
+  (not reachable in the current flow, since `main.py` already filters
+  `None` frames before they're queued, but kept in case that ever
+  changes) -- skips the Gemini call and logs rather than passing `None`
+  as an image.
+- `server.py`'s on-demand "Hey Cane" query handler and the
+  `/simulate/tof/{direction}` demo endpoint both also call
+  `capture_frame()` directly. Both were missed by the original task
+  description (which assumed only `narration_worker.py` needed updating)
+  and would have broken the moment `capture_frame()` became `async def`
+  -- an unawaited coroutine either raises `TypeError` (query handler,
+  which now falls back to the generic fallback answer on a `None` frame)
+  or gets pushed as a corrupt "frame" value (simulate endpoint, which now
+  skips the narration push on `None` instead).
+
+`mock_capture_frame()` is kept, not deleted, for tests and hardware-less
+dev -- same convention as `mock_read_all_tof()`/`mock_detection_stream()`.
+
+**Manual test path**: with `BOARD_IP` reachable on port `FRAME_PORT`, run
+the server and drive a detection through (real camera events, or the UDP
+test packet shown above) -- Gemini should now receive a real frame and
+`spoken_description` should reflect the actual scene rather than a
+solid-gray placeholder. With the board unreachable, confirm detections are
+still processed but no narration is produced for them (skipped, not
+crashed), and that `/ws/hazards` and `/ws/status` keep working normally
+throughout.
 
 ## Known mismatch with the current Swift app (flag for your teammate)
 

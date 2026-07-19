@@ -158,7 +158,15 @@ async def _handle_hazards_message(websocket: WebSocket, raw: str) -> None:
         logger.warning("Conversation memory read failed (answering without context): %s", exc)
 
     try:
-        frame = capture_frame()
+        # capture_frame() is now the real camera board (2026-07-19),
+        # async, and can return None on failure (board unreachable,
+        # timeout, bad response) -- raising here routes it through this
+        # same except block below with a clear message, rather than
+        # letting a None slip into answer_query() and fail with a
+        # confusing Gemini/image-decoding error instead.
+        frame = await capture_frame()
+        if frame is None:
+            raise RuntimeError("camera frame capture failed (board unreachable or bad response)")
         answer = await answer_query(frame, question, recent_context)
     except Exception as exc:  # noqa: BLE001 - a bad query must not kill the connection
         logger.error("Voice query handling failed, replying with fallback: %s", exc)
@@ -332,9 +340,16 @@ async def simulate_tof(direction: str) -> dict:
             "confidence": 0.95,
             "distance_m": _SIM_DISTANCE_M,
         }
-        _narration_queue.push_nowait(
-            {"source": "camera", "detection": detection, "frame": _capture_frame()}
-        )
+        # capture_frame() is now the real camera board (2026-07-19) and
+        # can return None on failure -- same "skip rather than push a
+        # frameless event" handling as main.py's _process_detection().
+        frame = await _capture_frame()
+        if frame is None:
+            logger.warning("Simulated ToF event: frame capture failed, skipping narration push")
+        else:
+            _narration_queue.push_nowait(
+                {"source": "camera", "detection": detection, "frame": frame}
+            )
 
     logger.info("Simulated ToF event: direction=%s object_class=%s", direction, object_class)
     return {"ok": True, "direction": direction, "object_class": object_class}

@@ -2,7 +2,8 @@
 Wires the full pipeline together and runs it as four independent
 background tasks alongside uvicorn:
 
-    mock detection stream -> attach_distance() -> should_escalate()
+    real camera detection events (CameraEventBridge, or mock_detection_stream
+        in --simulate-crash mode) -> attach_distance() -> should_escalate()
         -> capture_frame() -> narration_queue.push_nowait({"source": "camera", ...})
 
     mock ToF -> haptic_loop's check_thresholds() -> broadcast_haptic() (immediate, unthrottled)
@@ -47,6 +48,7 @@ load_dotenv()
 import uvicorn
 
 from pipeline import narration_queue
+from pipeline.camera_events import CameraEventBridge
 from pipeline.detection_input import (
     attach_distance,
     capture_frame,
@@ -62,45 +64,77 @@ from pipeline.throttle import HazardThrottle
 logger = logging.getLogger(__name__)
 
 
+async def _process_detection(detection: dict) -> None:
+    """
+    Shared post-processing for a raw detection, regardless of which
+    source (real camera events or the mock crash-stream) produced it.
+    """
+    # The camera has no depth perception -- attach_distance() has to run
+    # before should_escalate() can even look at distance_m. Async since it
+    # awaits the real (HTTP, off-thread) ToF read.
+    detection = await attach_distance(detection)
+
+    if not should_escalate(detection):
+        return
+
+    # capture_frame() is now the real camera board (2026-07-19) -- a
+    # blocking HTTP call wrapped in asyncio.to_thread() internally, so
+    # awaiting it here doesn't block anything else on the event loop even
+    # though it can take up to FRAME_TIMEOUT_S. Captured here (before
+    # queueing) so the queued event stays self-contained. This does mean a
+    # frame gets requested for every escalated detection, even ones the
+    # throttle will end up dropping -- unlike the Gemini call throttle
+    # still gates downstream in narration_worker, but that's the existing,
+    # accepted tradeoff for having one unified queue event shape.
+    #
+    # A None frame (board unreachable/timed out/bad response -- see
+    # capture_frame()'s docstring) means there's nothing to show Gemini:
+    # log it and drop this detection entirely rather than pushing a
+    # frameless event downstream. Haptics (the fast/safety-critical path)
+    # never depended on this and keeps working regardless.
+    frame = await capture_frame()
+    if frame is None:
+        logger.warning("Frame capture failed, skipping narration for detection: %s", detection)
+        return
+
+    narration_queue.push_nowait({"source": "camera", "detection": detection, "frame": frame})
+
+
 async def run_pipeline(simulate_crash: bool) -> None:
     """
-    Camera-originated half of the narration pipeline. Filters raw
-    detections and pushes the ones worth analyzing onto narration_queue --
-    throttling and Gemini analysis now happen in narration_worker.py, the
-    single place both narration origins (camera and overhead ToF) meet.
-    """
-    stream = mock_detection_stream(simulate_crash=simulate_crash)
+    Camera-originated half of the narration pipeline. By default, consumes
+    real detection events from the camera board via CameraEventBridge
+    (see camera_events.py). With --simulate-crash / SIMULATE_CRASH set,
+    uses mock_detection_stream()'s crash-mode generator instead -- kept
+    working deliberately, so HazardThrottle's chaotic-scene behavior can
+    still be demoed/verified on demand without needing the real hardware
+    to misbehave on cue (the same reasoning tof_input.py's kept mock
+    exists for).
 
+    Either way, filters raw detections and pushes the ones worth analyzing
+    onto narration_queue -- throttling and Gemini analysis happen in
+    narration_worker.py, the single place both narration origins (camera
+    and overhead ToF) meet.
+    """
     logger.info("Pipeline started (simulate_crash=%s)", simulate_crash)
 
-    while True:
+    if simulate_crash:
         # mock_detection_stream is a plain blocking generator (it paces
         # itself with time.sleep). Running next() in a worker thread keeps
         # that sleep from blocking the event loop uvicorn needs to keep
         # WebSocket connections alive.
-        #
-        # INTEGRATION POINT (real hardware): if the real feed is itself
-        # async (e.g. reading off a socket), swap this for a plain
-        # `async for detection in real_stream:` and drop the to_thread call.
-        detection = await asyncio.to_thread(next, stream)
-
-        # The camera has no depth perception -- attach_distance() has to
-        # run before should_escalate() can even look at distance_m. Async
-        # now that it awaits the real (HTTP, off-thread) ToF read.
-        detection = await attach_distance(detection)
-
-        if not should_escalate(detection):
-            continue
-
-        # Captured here so the queued event is self-contained. This does
-        # mean a frame gets captured for every escalated detection, even
-        # ones the throttle will end up dropping -- a small change from
-        # the old capture-only-if-narrating order, but capture_frame() is
-        # cheap/non-blocking (unlike the Gemini call throttle still gates
-        # downstream in narration_worker), so it's a low-cost tradeoff for
-        # having one unified queue event shape.
-        frame = capture_frame()
-        narration_queue.push_nowait({"source": "camera", "detection": detection, "frame": frame})
+        stream = mock_detection_stream(simulate_crash=True)
+        while True:
+            detection = await asyncio.to_thread(next, stream)
+            await _process_detection(detection)
+    else:
+        # CameraEventBridge must be constructed from within the running
+        # event loop (it captures asyncio.get_running_loop()) -- this is
+        # that context.
+        bridge = CameraEventBridge()
+        bridge.start()
+        async for detection in bridge.stream():
+            await _process_detection(detection)
 
 
 # The mock data never produces an "urgent" hazard on its own: the overhead

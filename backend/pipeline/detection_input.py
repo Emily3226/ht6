@@ -1,23 +1,21 @@
 """
 Stage 1 + Stage 2: detection ingest/filter, and frame capture.
 
-INTEGRATION POINT #1 (real hardware): mock_detection_stream() below stands
-in for the teammate's OAK-1-AF + ToF hardware pipeline. Swap it for the real
-feed by writing a generator (or async generator) with the same shape --
-yielding dicts matching the detection contract -- and pointing main.py at it
-instead.
-
-INTEGRATION POINT #2 (real camera): capture_frame() stands in for a real
-camera grab. See its docstring below.
+Detection events (mock_detection_stream(), used only for --simulate-crash
+now) and frame capture (capture_frame(), real as of 2026-07-19) both live
+here. Real detection events themselves come from camera_events.py, a
+separate module -- see main.py for how the two meet.
 """
 
 from __future__ import annotations
 
+import asyncio
 import io
 import random
 import time
-from typing import Iterator
+from typing import Iterator, Optional
 
+import requests
 from PIL import Image
 
 from pipeline import tof_input
@@ -197,21 +195,97 @@ def _simulate_crash_stream(duration_s: float = 120.0) -> Iterator[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Stage 2: frame capture. Swap for the real camera grab later.
+# Stage 2: frame capture -- real hardware, added 2026-07-19. Same
+# pattern as tof_input.py's read_all_tof(): a blocking HTTP call to her
+# board, wrapped in asyncio.to_thread() since it's awaited from the
+# narration pipeline's event loop.
 # ---------------------------------------------------------------------------
 
-def capture_frame() -> bytes:
+# Real hardware, provided by teammate -- same physical board as
+# tof_input.py's ToF endpoint and camera_events.py's detection-event
+# listener, different port. Hardcoded to match her code exactly (no env
+# var), consistent with those modules' BOARD_IP convention: specific to
+# this physical board, not a per-deployment config value.
+BOARD_IP = "172.20.10.2"
+FRAME_PORT = 8090
+
+# Frames are much larger than ToF's tiny JSON response (0.5s timeout
+# there), so this allows more time -- but still bounded, so a hung
+# request can't stall the narration worker (or anything else sharing its
+# event loop) indefinitely.
+FRAME_TIMEOUT_S = 3.0
+
+_frame_session = requests.Session()
+
+
+def _capture_frame_sync() -> Optional[bytes]:
     """
-    Placeholder frame capture.
+    Blocking HTTP call to the real camera board. Returns JPEG bytes on
+    success. On ANY failure -- timeout, connection error, non-200
+    response, or a response body that isn't actually a decodable image --
+    returns None rather than raising or returning empty/broken bytes, so
+    callers never need to handle a request exception directly, only a
+    None value (same contract as tof_input.py's ToF read).
+    """
+    try:
+        response = _frame_session.get(
+            f"http://{BOARD_IP}:{FRAME_PORT}/frame", timeout=FRAME_TIMEOUT_S
+        )
+    except Exception:
+        return None
 
-    INTEGRATION POINT: replace this with the real OAK-1-AF frame grab (e.g.
-    pulling the latest JPEG off the camera's output queue) once that
-    hardware is wired up. Keep the signature (-> bytes of a JPEG image) the
-    same so gemini_stage.analyze_hazard() doesn't need to change.
+    if response.status_code != 200:
+        return None
 
-    For now, generates a solid-color placeholder image with Pillow so the
-    rest of the pipeline (encoding, sending to Gemini, etc.) can be
-    exercised end-to-end without real camera hardware.
+    content = response.content
+    if not content:
+        return None
+
+    # Defensive: confirm this is actually a decodable image before handing
+    # it downstream -- a 200 response with a non-empty but corrupt/partial
+    # body should still be treated as a failure, not passed to Gemini.
+    try:
+        Image.open(io.BytesIO(content)).verify()
+    except Exception:
+        return None
+
+    return content
+
+
+async def capture_frame() -> Optional[bytes]:
+    """
+    Async wrapper around the real camera frame grab -- the ACTIVE
+    implementation, awaited from main.py's camera detection flow.
+
+    Runs the blocking HTTP call in a worker thread (asyncio.to_thread) so
+    a slow or unreachable board (up to FRAME_TIMEOUT_S, on every escalated
+    detection) can never freeze the event loop the rest of the server
+    depends on. Unlike read_all_tof() this isn't called at high
+    frequency -- only on escalated detections -- but it's still wrapped
+    the same way, since even an occasional multi-second block would stall
+    the narration worker and anything sharing its event loop.
+
+    Returns None on failure (see _capture_frame_sync()'s docstring) --
+    callers must treat None as "no frame available this time," skipping
+    the Gemini call and narration for that detection entirely rather than
+    sending Gemini broken/empty image data.
+    """
+    return await asyncio.to_thread(_capture_frame_sync)
+
+
+def mock_capture_frame() -> bytes:
+    """
+    The original placeholder frame capture, kept alongside the real
+    implementation (not deleted) for tests and hardware-less development.
+    Nothing in the active pipeline calls this anymore -- import and use it
+    explicitly if the real board isn't reachable.
+
+    Generates a solid-color placeholder image with Pillow so the rest of
+    the pipeline (encoding, sending to Gemini, etc.) can still be
+    exercised end-to-end without real camera hardware. Deliberately kept
+    synchronous (unlike mock_read_all_tof()) since nothing currently needs
+    it awaited -- swap it in directly wherever a bytes-returning
+    capture_frame() stand-in is needed.
     """
     image = Image.new("RGB", (640, 480), color=(80, 80, 80))
     buffer = io.BytesIO()

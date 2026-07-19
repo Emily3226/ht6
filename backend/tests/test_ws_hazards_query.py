@@ -46,11 +46,16 @@ def _patch_dependencies(monkeypatch):
     async def fake_answer_query(frame, question, recent_context):
         return f"answer to: {question}"
 
+    # capture_frame() is now async (real camera board, 2026-07-19) --
+    # this mock must match that signature, not a plain sync callable.
+    async def fake_capture_frame():
+        return b"fake-jpeg-bytes"
+
     monkeypatch.setattr(server.manager, "send_to", fake_send_to)
     monkeypatch.setattr(server.conversation_memory, "get_recent_context", fake_get_recent_context)
     monkeypatch.setattr(server.conversation_memory, "save_exchange", fake_save_exchange)
     monkeypatch.setattr(server, "answer_query", fake_answer_query)
-    monkeypatch.setattr(server, "capture_frame", lambda: b"fake-jpeg-bytes")
+    monkeypatch.setattr(server, "capture_frame", fake_capture_frame)
 
     return sent
 
@@ -107,7 +112,11 @@ def test_query_failure_replies_with_fallback_instead_of_raising(monkeypatch):
     assert message == {"answer": server._VOICE_QUERY_FALLBACK_ANSWER}
 
 
-def test_conversation_memory_failure_also_falls_back(monkeypatch):
+def test_conversation_memory_read_failure_still_answers_without_context(monkeypatch):
+    # Conversation memory is best-effort: a Mongo read failure shouldn't
+    # deny the user a real answer, just the cross-question context --
+    # this is a deliberate behavior (distinct from an answer_query()
+    # failure, which does fall back, see the test above), not a bug.
     sent = _patch_dependencies(monkeypatch)
 
     async def failing_get_recent_context(session_id, limit=5):
@@ -122,4 +131,24 @@ def test_conversation_memory_failure_also_falls_back(monkeypatch):
 
     assert len(sent) == 1
     _, message = sent[0]
-    assert message == {"answer": server._VOICE_QUERY_FALLBACK_ANSWER}
+    assert message == {"answer": "answer to: x"}
+
+
+def test_conversation_memory_save_failure_does_not_lose_the_answer(monkeypatch):
+    # A save_exchange() failure (also best-effort) must not prevent the
+    # already-computed answer from being sent back.
+    sent = _patch_dependencies(monkeypatch)
+
+    async def failing_save_exchange(session_id, question, answer):
+        raise RuntimeError("mongo unavailable")
+
+    monkeypatch.setattr(server.conversation_memory, "save_exchange", failing_save_exchange)
+    ws = FakeWebSocket()
+
+    asyncio.run(
+        server._handle_hazards_message(ws, '{"question": "x", "session_id": "s1"}')
+    )
+
+    assert len(sent) == 1
+    _, message = sent[0]
+    assert message == {"answer": "answer to: x"}
