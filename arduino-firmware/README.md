@@ -1,4 +1,4 @@
-# 😀 caneOS
+# 🙊 Sensors manual
 
 
 
