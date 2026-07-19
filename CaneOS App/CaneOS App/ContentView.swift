@@ -76,6 +76,8 @@ struct ContentView: View {
     /// Set while a question is in flight; cleared by answer, timeout, or
     /// cancel — a late answer after cancel is discarded.
     @State private var awaitingAnswer = false
+    /// The question was spoken into the Watch — play the answer there too.
+    @State private var answerTargetIsWatch = false
 
     /// Stable per-install session id sent with every voice question so the
     /// backend can keep per-user conversation context.
@@ -298,6 +300,7 @@ struct ContentView: View {
     /// The answer is spoken verbatim via ElevenLabs in handleVoiceAnswer.
     private func processVoiceCommand(_ question: String) {
         awaitingAnswer = true
+        answerTargetIsWatch = voice.lastCaptureFromWatch
         hazardsConnection.send([
             "question": question,
             "session_id": Self.voiceSessionId
@@ -312,7 +315,7 @@ struct ContentView: View {
             let fallback = "Sorry, I didn't get an answer from the backend."
             voice.lastReply = fallback
             voice.finishedThinking()
-            await speakAndPlay(fallback)
+            await deliverAnswerAudio(fallback)
         }
     }
 
@@ -326,7 +329,22 @@ struct ContentView: View {
         voice.lastReply = text
         voice.finishedThinking()
         phoneSession.sendVoiceUpdate(["voiceReply": text])
-        Task { await speakAndPlay(text) }
+        Task { await deliverAnswerAudio(text) }
+    }
+
+    /// Synthesizes the answer with ElevenLabs and plays it where the
+    /// question was asked: on the Watch when it came from the Watch mic
+    /// (falling back to the phone if the Watch drops), else on the phone.
+    private func deliverAnswerAudio(_ text: String) async {
+        do {
+            let audio = try await elevenLabs.synthesize(text: text)
+            if answerTargetIsWatch, phoneSession.sendAnswerAudio(audio) {
+                return
+            }
+            AudioPlaybackManager.shared.play(audio)
+        } catch {
+            print("ElevenLabs synthesis failed: \(error.localizedDescription)")
+        }
     }
 
     /// Cancel from the Watch (pinch/button while thinking) or the phone's
@@ -2027,7 +2045,7 @@ struct IncidentLocationSnapshot: View {
             span: MKCoordinateSpan(latitudeDelta: 0.01, longitudeDelta: 0.01)
         )
         options.size = size
-        options.scale = UIScreen.main.scale
+        options.scale = UITraitCollection.current.displayScale
         options.showsBuildings = false
 
         let snapshotter = MKMapSnapshotter(options: options)

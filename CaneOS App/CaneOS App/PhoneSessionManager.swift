@@ -102,6 +102,15 @@ final class PhoneSessionManager: NSObject, ObservableObject, WCSessionDelegate {
         WCSession.default.sendMessage(payload, replyHandler: nil)
     }
 
+    /// Ships synthesized answer audio (MP3) to the Watch for playback there.
+    /// Returns false when the Watch isn't reachable so the caller can fall
+    /// back to phone playback.
+    func sendAnswerAudio(_ data: Data) -> Bool {
+        guard WCSession.default.isReachable else { return false }
+        WCSession.default.sendMessageData(data, replyHandler: nil, errorHandler: nil)
+        return true
+    }
+
     func session(_ session: WCSession, activationDidCompleteWith state: WCSessionActivationState, error: Error?) {
         DispatchQueue.main.async {
             self.isWatchConnected = session.isPaired && session.isWatchAppInstalled

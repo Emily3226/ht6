@@ -145,14 +145,26 @@ async def _handle_hazards_message(websocket: WebSocket, raw: str) -> None:
     if not isinstance(question, str) or not isinstance(session_id, str):
         return
 
+    # Conversation memory is best-effort: if Mongo is down/unconfigured the
+    # user still gets a real answer — just without cross-question context —
+    # instead of the fallback apology.
+    recent_context = []
     try:
         recent_context = await conversation_memory.get_recent_context(session_id)
+    except Exception as exc:  # noqa: BLE001 - answer without context rather than fail
+        logger.warning("Conversation memory read failed (answering without context): %s", exc)
+
+    try:
         frame = capture_frame()
         answer = await answer_query(frame, question, recent_context)
-        await conversation_memory.save_exchange(session_id, question, answer)
     except Exception as exc:  # noqa: BLE001 - a bad query must not kill the connection
         logger.error("Voice query handling failed, replying with fallback: %s", exc)
         answer = _VOICE_QUERY_FALLBACK_ANSWER
+    else:
+        try:
+            await conversation_memory.save_exchange(session_id, question, answer)
+        except Exception as exc:  # noqa: BLE001 - memory write failure shouldn't lose the answer
+            logger.warning("Conversation memory save failed: %s", exc)
 
     try:
         await manager.send_to(websocket, {"answer": answer})

@@ -57,8 +57,9 @@ final class WatchVoiceManager: NSObject, ObservableObject {
             WKInterfaceDevice.current().play(.failure)
             return
         }
-        AVAudioSession.sharedInstance().requestRecordPermission { [weak self] granted in
-            DispatchQueue.main.async {
+        Task { [weak self] in
+            let granted = await AVAudioApplication.requestRecordPermission()
+            await MainActor.run {
                 guard granted else {
                     WKInterfaceDevice.current().play(.failure)
                     return
@@ -69,18 +70,25 @@ final class WatchVoiceManager: NSObject, ObservableObject {
     }
 
     private func beginStreaming() {
+        // Flip the UI and buzz FIRST — the red listening circle must appear
+        // the instant the user pinches, not after the audio engine spins up
+        // (engine + session setup can take a noticeable fraction of a second).
+        transcript = ""
+        lastReply = ""
+        state = .capturing
+        WKInterfaceDevice.current().play(.start)
+        sendControl("start")
+
         do {
             let session = AVAudioSession.sharedInstance()
             try session.setCategory(.record, mode: .default)
             try session.setActive(true)
         } catch {
             print("[WatchVoice] audio session error: \(error.localizedDescription)")
+            state = .idle
+            sendControl("cancel")
             return
         }
-
-        transcript = ""
-        lastReply = ""
-        sendControl("start")
 
         let input = audioEngine.inputNode
         let inputFormat = input.outputFormat(forBus: 0)
@@ -95,13 +103,12 @@ final class WatchVoiceManager: NSObject, ObservableObject {
             try audioEngine.start()
         } catch {
             print("[WatchVoice] engine error: \(error.localizedDescription)")
+            state = .idle
             sendControl("cancel")
             return
         }
 
         isStreaming = true
-        state = .capturing
-        WKInterfaceDevice.current().play(.start)
     }
 
     /// Audio-thread callback: downsample the chunk and ship it to the phone.
@@ -168,6 +175,27 @@ final class WatchVoiceManager: NSObject, ObservableObject {
         DispatchQueue.main.async {
             self.lastReply = text
             WKInterfaceDevice.current().play(.success)
+        }
+    }
+
+    // MARK: - Answer audio playback (on the Watch speaker / paired buds)
+
+    private var player: AVAudioPlayer?
+
+    /// ElevenLabs MP3 audio for the answer, synthesized on the phone and
+    /// shipped here so the voice comes out of the WATCH, not the phone.
+    func playAnswer(_ data: Data) {
+        DispatchQueue.main.async {
+            do {
+                let session = AVAudioSession.sharedInstance()
+                try session.setCategory(.playback, mode: .spokenAudio)
+                try session.setActive(true)
+                self.player = try AVAudioPlayer(data: data)
+                self.player?.prepareToPlay()
+                self.player?.play()
+            } catch {
+                print("[WatchVoice] playback error: \(error.localizedDescription)")
+            }
         }
     }
 }

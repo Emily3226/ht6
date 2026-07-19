@@ -139,7 +139,8 @@ final class VoiceAssistantManager: NSObject, ObservableObject {
 
         silenceTimer?.invalidate()
         silenceTimer = Timer.scheduledTimer(withTimeInterval: 0.4, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.checkForEndOfSpeech() }
+            guard let self else { return }
+            Task { @MainActor in self.checkForEndOfSpeech() }
         }
     }
 
@@ -175,7 +176,8 @@ final class VoiceAssistantManager: NSObject, ObservableObject {
 
         silenceTimer?.invalidate()
         silenceTimer = Timer.scheduledTimer(withTimeInterval: 0.4, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.checkForEndOfSpeech() }
+            guard let self else { return }
+            Task { @MainActor in self.checkForEndOfSpeech() }
         }
     }
 
@@ -195,8 +197,13 @@ final class VoiceAssistantManager: NSObject, ObservableObject {
         }
     }
 
+    /// True if the most recent finalized capture came from the Watch mic —
+    /// used to route the answer audio back to the Watch speaker.
+    private(set) var lastCaptureFromWatch = false
+
     private func finalizeCapture() {
         let command = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+        lastCaptureFromWatch = listeningOnWatch
         stopCapture()
         guard !command.isEmpty else {
             state = .idle
