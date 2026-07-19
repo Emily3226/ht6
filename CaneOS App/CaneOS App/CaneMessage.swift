@@ -59,15 +59,20 @@ struct HazardMessage: Decodable {
 enum CaneHazardChannelEvent: Decodable {
     case hazard(HazardMessage)
     case sceneDescription(text: String)
+    /// Reply to a voice question ({"question", "session_id"} sent by the
+    /// app): {"answer": "<english answer>"} — spoken verbatim by ElevenLabs.
+    case answer(text: String)
 
     private enum CodingKeys: String, CodingKey {
-        case type, text
+        case type, text, answer
     }
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        if let type = try container.decodeIfPresent(String.self, forKey: .type),
-           type == "scene_description" {
+        if let answer = try container.decodeIfPresent(String.self, forKey: .answer) {
+            self = .answer(text: answer)
+        } else if let type = try container.decodeIfPresent(String.self, forKey: .type),
+                  type == "scene_description" {
             let text = try container.decode(String.self, forKey: .text)
             self = .sceneDescription(text: text)
         } else {

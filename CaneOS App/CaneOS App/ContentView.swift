@@ -72,12 +72,20 @@ struct ContentView: View {
     @State private var smsCompose: SMSCompose?
 
     @StateObject private var voice = VoiceAssistantManager()
-    /// Set when a voice request asked for a scan — the incoming
-    /// scene_description gets answered against this question.
-    @State private var pendingVoiceQuestion: String?
+    @State private var answerTimeout: Task<Void, Never>?
+
+    /// Stable per-install session id sent with every voice question so the
+    /// backend can keep per-user conversation context.
+    private static let voiceSessionId: String = {
+        if let existing = UserDefaults.standard.string(forKey: "voiceSessionId") {
+            return existing
+        }
+        let id = "user_" + String(UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(12)).lowercased()
+        UserDefaults.standard.set(id, forKey: "voiceSessionId")
+        return id
+    }()
 
     private let elevenLabs = ElevenLabsClient(apiKey: Config.elevenLabsAPIKey, voiceId: Config.elevenLabsVoiceId)
-    private let backboard  = BackboardClient(apiKey: Config.backboardAPIKey)
 
     var body: some View {
         // Launch flow: hold on a splash while the stored Auth0 session
@@ -180,10 +188,11 @@ struct ContentView: View {
         .onAppear {
             connectToBackend()
             syncLocationSharing()
-            // Hands-free voice: listen for "Hey Cane" whenever the app is up,
-            // and let the Watch's double-pinch gesture wake capture directly.
+            // Voice: woken only by the Watch's double-pinch gesture (or the
+            // phone's mic button) — no wake word. Permissions prompt once at
+            // launch so the first pinch never stalls.
             voice.onCommand = { command in processVoiceCommand(command) }
-            voice.startWakeWord()
+            voice.requestPermissions()
             phoneSession.onVoiceWake = { voice.wakeFromGesture() }
             phoneSession.onWatchScanRequest = { requestSceneDescription() }
         }
@@ -241,6 +250,8 @@ struct ContentView: View {
                     handleHazard(hazard)
                 case .sceneDescription(let text):
                     await handleSceneDescription(text)
+                case .answer(let text):
+                    handleVoiceAnswer(text)
                 }
             }
         }
@@ -260,49 +271,41 @@ struct ContentView: View {
         voice.manualToggle()
     }
 
-    /// Routes a finished voice request: scan intents go to the Python
-    /// backend (with the spoken text attached); everything else is answered
-    /// by Backboard from memory.
+    /// Ships a finished voice request to the Python backend over the
+    /// /ws/hazards socket. Contract (agreed with the backend side):
+    ///   app  → server: {"question": "<transcribed speech>", "session_id": "user_abc123"}
+    ///   server → app:  {"answer": "<plain-English answer>"}
+    /// The answer is spoken verbatim via ElevenLabs in handleVoiceAnswer.
     private func processVoiceCommand(_ question: String) {
-        if VoiceAssistantManager.isScanIntent(question) {
-            pendingVoiceQuestion = question
-            requestSceneDescription(question: question)
-        } else {
-            Task { await answerVoiceQuestion(question) }
+        hazardsConnection.send([
+            "question": question,
+            "session_id": Self.voiceSessionId
+        ])
+
+        // Safety net: if no answer arrives, say so instead of spinning forever.
+        answerTimeout?.cancel()
+        answerTimeout = Task {
+            try? await Task.sleep(for: .seconds(25))
+            guard !Task.isCancelled else { return }
+            let fallback = "Sorry, I didn't get an answer from the backend."
+            voice.lastReply = fallback
+            voice.finishedThinking()
+            await speakAndPlay(fallback)
         }
     }
 
-    /// Non-scan questions ("what's happening right now?", anything): answered
-    /// by Backboard using its thread memory plus the recent-events context.
-    private func answerVoiceQuestion(_ question: String) async {
-        let prompt = """
-        You are CaneOS, a voice assistant for a blind cane user. Recent events \
-        the system detected (newest first):
-        \(voice.contextBlock())
-
-        The user asked: "\(question)"
-
-        Answer in one or two short spoken sentences. Use the events and our \
-        conversation history for context, and don't repeat details you've \
-        already told them unless they ask again.
-        """
-        do {
-            let reply = try await backboard.send(text: prompt)
-            voice.lastReply = reply
-            voice.finishedThinking()
-            await speakAndPlay(reply)
-        } catch {
-            voice.finishedThinking()
-            let fallback = "Sorry, I couldn't reach my memory right now."
-            voice.lastReply = fallback
-            await speakAndPlay(fallback)
-        }
+    /// {"answer": "..."} arrived from the backend — speak it.
+    private func handleVoiceAnswer(_ text: String) {
+        answerTimeout?.cancel()
+        answerTimeout = nil
+        voice.lastReply = text
+        voice.finishedThinking()
+        Task { await speakAndPlay(text) }
     }
 
     private func handleHazard(_ hazard: HazardMessage) {
         lastHazard = hazard
         isScanning = false
-        voice.recordEvent("Hazard: \(hazard.hazardType.replacingOccurrences(of: "_", with: " ")) to the \(hazard.direction.rawValue), \(hazard.urgency) urgency — \"\(hazard.spokenDescription)\"")
         let incidentId = incidents.log(
             hazardType: hazard.hazardType,
             direction:  hazard.direction.rawValue,
@@ -484,28 +487,7 @@ struct ContentView: View {
 
     private func handleSceneDescription(_ text: String) async {
         isScanning = false
-        voice.recordEvent("Camera scan result: \(text)")
-
-        let question = pendingVoiceQuestion
-        pendingVoiceQuestion = nil
-        let prompt = """
-        You are CaneOS, a voice assistant for a blind cane user. A fresh \
-        camera scan just returned: "\(text)"
-        \(question.map { "The user asked: \"\($0)\"" } ?? "The user requested this scan.")
-
-        Describe the scene in one or two short spoken sentences, focusing on \
-        what's new or changed versus what you've already told them in this \
-        conversation — don't repeat unchanged details.
-        """
-        do {
-            let reply = try await backboard.send(text: prompt)
-            voice.lastReply = reply
-            voice.finishedThinking()
-            await speakAndPlay(reply)
-        } catch {
-            voice.finishedThinking()
-            await speakAndPlay(text)
-        }
+        await speakAndPlay(text)
     }
 
     private func speakAndPlay(_ text: String) async {
@@ -562,7 +544,7 @@ struct HomeView: View {
                 Spacer()
                 Text(voiceStatusLabel)
                     .font(.caption)
-                    .foregroundColor(voice.state == .wakeListening ? .green : Color(white: 0.50))
+                    .foregroundColor(voice.state == .idle ? .green : Color(white: 0.50))
             }
 
             // Mic button with pulsing rings while capturing
@@ -602,7 +584,7 @@ struct HomeView: View {
             .accessibilityLabel(voice.state == .capturing
                 ? "Listening. Tap to finish, or just stop talking."
                 : "Ask Cane a question by voice")
-            .accessibilityHint("Say Hey Cane, or tap. Try: what's around me, or: what's happening right now")
+            .accessibilityHint("Double-pinch on your Watch, or tap here. Try: what's around me, or: what's happening right now")
 
             // Live transcript while capturing
             if voice.state == .capturing {
@@ -616,8 +598,8 @@ struct HomeView: View {
                     .font(.caption)
                     .foregroundColor(.orange)
                     .multilineTextAlignment(.center)
-            } else if voice.state == .wakeListening && voice.lastReply.isEmpty {
-                Text("Say “Hey Cane” or double-pinch on your Watch — then ask “what's around me?” or “what's happening right now?”")
+            } else if voice.state == .idle && voice.lastReply.isEmpty {
+                Text("Double-pinch on your Apple Watch (or tap the mic) — then ask “what's around me?” or “what's happening right now?”")
                     .font(.caption)
                     .foregroundColor(Color(white: 0.50))
                     .multilineTextAlignment(.center)
@@ -648,11 +630,10 @@ struct HomeView: View {
 
     private var voiceStatusLabel: String {
         switch voice.state {
-        case .idle:          return "Starting…"
-        case .wakeListening: return "● Waiting for “Hey Cane”"
-        case .capturing:     return "Listening…"
-        case .thinking:      return "Thinking…"
-        case .denied:        return "Permission needed"
+        case .idle:      return "● Ready — double-pinch to talk"
+        case .capturing: return "Listening…"
+        case .thinking:  return "Thinking…"
+        case .denied:    return "Permission needed"
         }
     }
 
