@@ -25,6 +25,13 @@ final class VoiceAssistantManager: NSObject, ObservableObject {
     @Published var state: AssistantState = .idle
     @Published var transcript: String = ""
     @Published var lastReply: String = ""
+    /// True while the audio being transcribed streams from the Watch mic.
+    @Published var listeningOnWatch = false
+
+    /// Format of the audio chunks the Watch streams over (16 kHz mono Int16).
+    private static let remoteFormat = AVAudioFormat(
+        commonFormat: .pcmFormatInt16, sampleRate: 16000, channels: 1, interleaved: true
+    )!
 
     /// Called with the final transcribed request once the user stops talking.
     var onCommand: ((String) -> Void)?
@@ -93,6 +100,68 @@ final class VoiceAssistantManager: NSObject, ObservableObject {
     /// Called by the owner once the reply has been handled.
     func finishedThinking() {
         state = .idle
+    }
+
+    /// Hard cancel from any state (mid-capture or mid-thinking).
+    func cancelAll() {
+        stopCapture()
+        state = .idle
+    }
+
+    // MARK: - Watch-mic capture (audio streamed over WCSession)
+
+    /// The Watch started streaming its mic: run recognition on that stream
+    /// instead of the phone mic. Same silence-endpointing as local capture.
+    func beginRemoteCapture() {
+        guard state == .idle || state == .denied else { return }
+        guard let recognizer, recognizer.isAvailable else { return }
+        stopCapture()
+        transcript = ""
+
+        let request = SFSpeechAudioBufferRecognitionRequest()
+        request.shouldReportPartialResults = true
+        recognitionRequest = request
+        listeningOnWatch = true
+        state = .capturing
+        captureBegan = Date()
+        lastTranscriptChange = Date()
+
+        recognitionTask = recognizer.recognitionTask(with: request) { [weak self] result, _ in
+            Task { @MainActor in
+                guard let self, let result else { return }
+                let text = result.bestTranscription.formattedString
+                if text != self.transcript {
+                    self.transcript = text
+                    self.lastTranscriptChange = Date()
+                }
+            }
+        }
+
+        silenceTimer?.invalidate()
+        silenceTimer = Timer.scheduledTimer(withTimeInterval: 0.4, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.checkForEndOfSpeech() }
+        }
+    }
+
+    /// One chunk of Watch mic audio (16 kHz mono Int16 PCM).
+    func appendRemoteAudio(_ data: Data) {
+        guard listeningOnWatch, let request = recognitionRequest else { return }
+        let frames = AVAudioFrameCount(data.count / MemoryLayout<Int16>.size)
+        guard frames > 0,
+              let buffer = AVAudioPCMBuffer(pcmFormat: Self.remoteFormat, frameCapacity: frames) else { return }
+        buffer.frameLength = frames
+        data.withUnsafeBytes { raw in
+            if let base = raw.baseAddress, let dst = buffer.int16ChannelData {
+                memcpy(dst[0], base, Int(frames) * MemoryLayout<Int16>.size)
+            }
+        }
+        request.append(buffer)
+    }
+
+    /// The Watch user tapped/pinched to finish early.
+    func endRemoteCapture() {
+        guard state == .capturing, listeningOnWatch else { return }
+        finalizeCapture()
     }
 
     // MARK: - Command capture
@@ -188,5 +257,6 @@ final class VoiceAssistantManager: NSObject, ObservableObject {
         recognitionTask = nil
         silenceTimer?.invalidate()
         silenceTimer = nil
+        listeningOnWatch = false
     }
 }

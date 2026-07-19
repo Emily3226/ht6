@@ -456,6 +456,7 @@
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = 4;
+				INFOPLIST_KEY_NSMicrophoneUsageDescription = "CaneOS uses the Watch microphone so you can speak questions after a double pinch.";
 				WATCHOS_DEPLOYMENT_TARGET = 26.5;
 			};
 			name = Debug;
@@ -489,6 +490,7 @@
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = 4;
+				INFOPLIST_KEY_NSMicrophoneUsageDescription = "CaneOS uses the Watch microphone so you can speak questions after a double pinch.";
 				WATCHOS_DEPLOYMENT_TARGET = 26.5;
 			};
 			name = Release;

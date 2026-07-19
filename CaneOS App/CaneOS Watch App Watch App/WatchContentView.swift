@@ -56,6 +56,11 @@ struct ContentView: View {
 
 struct WatchMainView: View {
     @ObservedObject var session: WatchSessionManager
+    @ObservedObject var voice = WatchVoiceManager.shared
+    @State private var pulse = false
+
+    private let caneBlue = Color(red: 0.12, green: 0.46, blue: 1.00)
+    private let caneRed  = Color(red: 0.90, green: 0.10, blue: 0.10)
 
     var body: some View {
         ZStack {
@@ -87,46 +92,116 @@ struct WatchMainView: View {
                     ? "Phone connected"
                     : "Phone not reachable")
 
-                // Scan button
-                Button(action: session.requestScan) {
-                    ZStack {
-                        Circle()
-                            .fill(Color(red: 0.12, green: 0.46, blue: 1.00))
-                        VStack(spacing: 4) {
-                            Image(systemName: "camera.viewfinder")
-                                .font(.system(size: 22, weight: .medium))
-                                .foregroundColor(.white)
-                            Text("What's\naround me?")
-                                .font(.system(size: 11, weight: .bold))
-                                .foregroundColor(.white)
-                                .multilineTextAlignment(.center)
+                // Center area mirrors the voice assistant state. The Double
+                // Tap (double pinch) gesture always lands on the visible
+                // primary control: start talking / finish early / cancel.
+                switch voice.state {
+                case .capturing:
+                    // LISTENING — speak into the watch; stops on silence.
+                    Button(action: voice.toggle) {
+                        ZStack {
+                            Circle()
+                                .stroke(caneRed.opacity(0.5), lineWidth: 3)
+                                .frame(width: 108, height: 108)
+                                .scaleEffect(pulse ? 1.12 : 0.96)
+                                .opacity(pulse ? 0.2 : 0.8)
+                                .animation(.easeOut(duration: 0.9).repeatForever(autoreverses: false),
+                                           value: pulse)
+                            Circle().fill(caneRed)
+                                .frame(width: 92, height: 92)
+                            VStack(spacing: 3) {
+                                Image(systemName: "waveform")
+                                    .font(.system(size: 24, weight: .semibold))
+                                Text("Listening…")
+                                    .font(.system(size: 10, weight: .bold))
+                            }
+                            .foregroundColor(.white)
                         }
                     }
-                }
-                .frame(width: 130, height: 130)
-                .buttonStyle(.plain)
-                .accessibilityLabel("Scan environment, what's around me")
-                .accessibilityHint("Triggers spoken audio description of surroundings")
+                    .buttonStyle(.plain)
+                    .handGestureShortcut(.primaryAction)
+                    .onAppear { pulse = true }
+                    .accessibilityLabel("Listening. Speak now. Double pinch or tap to finish early.")
 
-                // Ask Cane — the Double Tap (double pinch) gesture lands here,
-                // waking the phone's voice assistant hands-free.
-                Button(action: session.requestVoiceWake) {
-                    HStack(spacing: 5) {
-                        Image(systemName: "mic.fill")
-                            .font(.system(size: 11, weight: .bold))
-                        Text("Ask Cane")
-                            .font(.system(size: 11, weight: .bold))
+                    Text(voice.transcript.isEmpty ? "Speak into your watch" : "“\(voice.transcript)”")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundColor(Color(white: 0.75))
+                        .lineLimit(2)
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal, 4)
+
+                case .thinking:
+                    // WAITING FOR THE ANSWER — cancel via pinch or button.
+                    VStack(spacing: 8) {
+                        ProgressView().tint(caneBlue).scaleEffect(1.3)
+                        Text("Thinking…")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundColor(.white)
+                        Button(action: voice.toggle) {
+                            Text("CANCEL")
+                                .font(.system(size: 13, weight: .black))
+                                .foregroundColor(.white)
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 8)
+                                .background(caneRed.opacity(0.85))
+                                .cornerRadius(10)
+                        }
+                        .buttonStyle(.plain)
+                        .handGestureShortcut(.primaryAction)
+                        .accessibilityLabel("Cancel the question")
+                        .accessibilityHint("Double pinch or tap to cancel")
                     }
-                    .foregroundColor(.white)
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 6)
-                    .background(Color(red: 0.12, green: 0.46, blue: 1.00).opacity(0.35))
-                    .cornerRadius(10)
+                    .padding(.horizontal, 10)
+
+                case .idle:
+                    // Scan button
+                    Button(action: session.requestScan) {
+                        ZStack {
+                            Circle().fill(caneBlue)
+                            VStack(spacing: 4) {
+                                Image(systemName: "camera.viewfinder")
+                                    .font(.system(size: 22, weight: .medium))
+                                    .foregroundColor(.white)
+                                Text("What's\naround me?")
+                                    .font(.system(size: 11, weight: .bold))
+                                    .foregroundColor(.white)
+                                    .multilineTextAlignment(.center)
+                            }
+                        }
+                    }
+                    .frame(width: 110, height: 110)
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Scan environment, what's around me")
+                    .accessibilityHint("Triggers spoken audio description of surroundings")
+
+                    // Ask Cane — double pinch starts listening on the WATCH mic.
+                    Button(action: voice.toggle) {
+                        HStack(spacing: 5) {
+                            Image(systemName: "mic.fill")
+                                .font(.system(size: 11, weight: .bold))
+                            Text("Ask Cane")
+                                .font(.system(size: 11, weight: .bold))
+                        }
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 6)
+                        .background(caneBlue.opacity(0.35))
+                        .cornerRadius(10)
+                    }
+                    .buttonStyle(.plain)
+                    .handGestureShortcut(.primaryAction) // Double Tap (pinch ×2) on S9+
+                    .accessibilityLabel("Ask Cane by voice")
+                    .accessibilityHint("Double pinch your fingers or tap, then speak into your watch")
+
+                    if !voice.lastReply.isEmpty {
+                        Text(voice.lastReply)
+                            .font(.system(size: 10))
+                            .foregroundColor(Color(white: 0.70))
+                            .lineLimit(2)
+                            .multilineTextAlignment(.center)
+                            .padding(.horizontal, 6)
+                    }
                 }
-                .buttonStyle(.plain)
-                .handGestureShortcut(.primaryAction) // Double Tap (pinch ×2) on S9+
-                .accessibilityLabel("Ask Cane by voice")
-                .accessibilityHint("Double pinch your fingers or tap, then speak to your phone")
 
                 // Last hazard direction
                 if session.lastDirection != "-" {

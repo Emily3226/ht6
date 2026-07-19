@@ -73,6 +73,9 @@ struct ContentView: View {
 
     @StateObject private var voice = VoiceAssistantManager()
     @State private var answerTimeout: Task<Void, Never>?
+    /// Set while a question is in flight; cleared by answer, timeout, or
+    /// cancel — a late answer after cancel is discarded.
+    @State private var awaitingAnswer = false
 
     /// Stable per-install session id sent with every voice question so the
     /// backend can keep per-user conversation context.
@@ -188,13 +191,26 @@ struct ContentView: View {
         .onAppear {
             connectToBackend()
             syncLocationSharing()
-            // Voice: woken only by the Watch's double-pinch gesture (or the
-            // phone's mic button) — no wake word. Permissions prompt once at
-            // launch so the first pinch never stalls.
+            // Voice: the Watch's double-pinch starts WATCH-mic capture; the
+            // audio streams here for recognition. Permissions prompt once at
+            // launch so the first use never stalls.
             voice.onCommand = { command in processVoiceCommand(command) }
             voice.requestPermissions()
+            phoneSession.onVoiceControl = { control in
+                switch control {
+                case "start":  voice.beginRemoteCapture()
+                case "stop":   voice.endRemoteCapture()
+                case "cancel": cancelVoiceRequest()
+                default: break
+                }
+            }
+            phoneSession.onVoiceAudio = { data in voice.appendRemoteAudio(data) }
             phoneSession.onVoiceWake = { voice.wakeFromGesture() }
             phoneSession.onWatchScanRequest = { requestSceneDescription() }
+        }
+        .onChange(of: voice.state) { pushVoiceStateToWatch() }
+        .onChange(of: voice.transcript) {
+            phoneSession.sendVoiceUpdate(["voiceTranscript": voice.transcript])
         }
         .sheet(item: $smsCompose) { compose in
             SMSComposeView(compose: compose) { smsCompose = nil }
@@ -268,7 +284,11 @@ struct ContentView: View {
     // MARK: - Voice assistant ("Ask Cane")
 
     private func handleVoiceTap() {
-        voice.manualToggle()
+        if voice.state == .thinking {
+            cancelVoiceRequest()
+        } else {
+            voice.manualToggle()
+        }
     }
 
     /// Ships a finished voice request to the Python backend over the
@@ -277,6 +297,7 @@ struct ContentView: View {
     ///   server → app:  {"answer": "<plain-English answer>"}
     /// The answer is spoken verbatim via ElevenLabs in handleVoiceAnswer.
     private func processVoiceCommand(_ question: String) {
+        awaitingAnswer = true
         hazardsConnection.send([
             "question": question,
             "session_id": Self.voiceSessionId
@@ -287,6 +308,7 @@ struct ContentView: View {
         answerTimeout = Task {
             try? await Task.sleep(for: .seconds(25))
             guard !Task.isCancelled else { return }
+            awaitingAnswer = false
             let fallback = "Sorry, I didn't get an answer from the backend."
             voice.lastReply = fallback
             voice.finishedThinking()
@@ -294,13 +316,38 @@ struct ContentView: View {
         }
     }
 
-    /// {"answer": "..."} arrived from the backend — speak it.
+    /// {"answer": "..."} arrived from the backend — speak it (unless the
+    /// user cancelled while it was in flight).
     private func handleVoiceAnswer(_ text: String) {
+        guard awaitingAnswer else { return }
+        awaitingAnswer = false
         answerTimeout?.cancel()
         answerTimeout = nil
         voice.lastReply = text
         voice.finishedThinking()
+        phoneSession.sendVoiceUpdate(["voiceReply": text])
         Task { await speakAndPlay(text) }
+    }
+
+    /// Cancel from the Watch (pinch/button while thinking) or the phone's
+    /// ✕ button — abandon the in-flight question and go back to idle.
+    private func cancelVoiceRequest() {
+        awaitingAnswer = false
+        answerTimeout?.cancel()
+        answerTimeout = nil
+        voice.cancelAll()
+    }
+
+    /// Mirrors the assistant state to the Watch so its UI matches the phone.
+    private func pushVoiceStateToWatch() {
+        let stateName: String
+        switch voice.state {
+        case .idle:      stateName = "idle"
+        case .capturing: stateName = "capturing"
+        case .thinking:  stateName = "thinking"
+        case .denied:    stateName = "denied"
+        }
+        phoneSession.sendVoiceUpdate(["voiceState": stateName])
     }
 
     private func handleHazard(_ hazard: HazardMessage) {
@@ -571,7 +618,10 @@ struct HomeView: View {
                         .shadow(color: (voice.state == .capturing ? Color.caneRed : Color.caneBlue).opacity(0.5),
                                 radius: micPulse && voice.state == .capturing ? 18 : 8)
                     if voice.state == .thinking {
-                        ProgressView().tint(.white).scaleEffect(1.4)
+                        // Tap = cancel the in-flight question
+                        Image(systemName: "xmark")
+                            .font(.system(size: 30, weight: .bold))
+                            .foregroundColor(.white)
                     } else {
                         Image(systemName: voice.state == .capturing ? "waveform" : "mic.fill")
                             .font(.system(size: 32, weight: .semibold))
@@ -579,11 +629,12 @@ struct HomeView: View {
                     }
                 }
             }
-            .disabled(voice.state == .thinking)
             .onAppear { micPulse = true }
             .accessibilityLabel(voice.state == .capturing
                 ? "Listening. Tap to finish, or just stop talking."
-                : "Ask Cane a question by voice")
+                : voice.state == .thinking
+                    ? "Waiting for the answer. Tap to cancel."
+                    : "Ask Cane a question by voice")
             .accessibilityHint("Double-pinch on your Watch, or tap here. Try: what's around me, or: what's happening right now")
 
             // Live transcript while capturing
@@ -631,8 +682,8 @@ struct HomeView: View {
     private var voiceStatusLabel: String {
         switch voice.state {
         case .idle:      return "● Ready — double-pinch to talk"
-        case .capturing: return "Listening…"
-        case .thinking:  return "Thinking…"
+        case .capturing: return voice.listeningOnWatch ? "Listening on Watch…" : "Listening…"
+        case .thinking:  return "Thinking… tap ✕ to cancel"
         case .denied:    return "Permission needed"
         }
     }
