@@ -28,9 +28,11 @@ Pipeline stages (see `pipeline/`):
 1. **detection_input.py** -- filters raw detections (`should_escalate`),
    attaches ToF-sourced distance (`attach_distance`), and provides the mock
    detection/frame sources for now.
-2. **tof_input.py** -- mock ToF (time-of-flight) sensor reads for three
-   units (left/right/up); the single shared integration point for real ToF
-   hardware, called by both paths.
+2. **tof_input.py** -- real ToF (time-of-flight) hardware reads for three
+   units (left/right/up), added 2026-07-19 (see "Real ToF hardware" below);
+   the single interface to ToF hardware, called by both paths. The
+   original mock is kept alongside as `mock_read_all_tof()` for tests and
+   hardware-less development.
 3. **narration_queue.py** -- the shared queue where camera-originated and
    overhead-ToF-originated events both land, consumed by
    `narration_worker.py`. `push_nowait()` never blocks and never raises.
@@ -125,9 +127,10 @@ arrives. You should see one roughly every few seconds in normal mock mode
 
 ## Haptic reflex path (`/ws/haptics`)
 
-A tight polling loop (`haptic_loop.py`, ~15Hz) reads the three mock ToF
-sensors (`tof_input.py`) and checks thresholds (`haptic_trigger.py`), purely
-for low detection latency. What sits between detection and the actual
+A tight polling loop (`haptic_loop.py`, ~15Hz) reads the three real ToF
+sensors (`tof_input.py` -- see "Real ToF hardware" below) and checks
+thresholds (`haptic_trigger.py`), purely for low detection latency. What
+sits between detection and the actual
 `/ws/haptics` broadcast is `haptic_arbiter.HapticArbiter` (added
 2026-07-18), which paces and prioritizes what actually gets sent -- the
 message format itself is unchanged:
@@ -145,14 +148,15 @@ This exists because a sensor reading jittering around one physical
 object's real distance (e.g. wobbling between 0.7m and 0.85m) would
 otherwise flip triggered/cleared on every single ~15Hz poll, making one
 continuous hazard look like dozens of separate ones to everything
-downstream. `tof_input.py` separately smooths its own mock dip readings
-(one baseline distance per dip, jittered only slightly, rather than a
-fresh independent draw every call) to reduce how often a dip's readings
-wander across a threshold in the first place -- but hysteresis is what
-actually closes the remaining gap, since even smoothed readings can
-occasionally land close enough to a threshold to cross it. It's a
-distance-based band, not a time-based debounce, so it doesn't delay a
-genuinely new hazard's first trigger.
+downstream. (`tof_input.mock_read_all_tof()`, kept alongside the real
+implementation for tests/hardware-less dev, separately smooths its own
+simulated dip readings -- one baseline distance per dip, jittered only
+slightly, rather than a fresh independent draw every call -- to reduce how
+often a dip's readings wander across a threshold in the first place; the
+real hardware obviously isn't something we can "smooth," which is exactly
+why hysteresis lives here rather than relying on the sensor being clean.)
+It's a distance-based band, not a time-based debounce, so it doesn't delay
+a genuinely new hazard's first trigger.
 
 **Why pacing was needed:** broadcasting on every ~15Hz poll cycle is far
 faster than the Apple Watch's Taptic Engine can physically play (each buzz
@@ -430,23 +434,89 @@ is closer). `main.py`'s pipeline calls `attach_distance()` before
 `detection["distance_m"]`, it just now requires that field to have already
 been attached.
 
-## Integration points for teammates
+## Real ToF hardware (added 2026-07-19)
 
-- **Real ToF hardware**: `pipeline/tof_input.py`, replace the body of
-  `read_all_tof()` with the real sensor read. It's the *only* interface to
-  ToF hardware -- both the haptic loop and the camera path
-  (`attach_distance()`) call through it, so nothing downstream needs to
-  change as long as the return shape (`{"left": float, "right": float, "up": float}`)
-  stays the same.
+`pipeline/tof_input.py`'s `read_all_tof()` is now a real hardware read, not
+a mock -- provided by a teammate, integrated as-is (her HTTP-polling logic
+is unmodified): `requests.Session().get(f"http://{BOARD_IP}:8080/tof",
+timeout=0.5).json()`, returning
+`{"left": 2.1, "right": 3.4, "up": None}` in meters, where `None` means
+"no reading for that direction" (sensor not wired up, or hasn't reported
+since startup). `BOARD_IP` (`172.20.10.2`) is hardcoded to match her board
+exactly -- it's tied to the specific physical hardware on her hotspot
+network, not a per-deployment config value, so there's no env var for it.
+
+**Async wrapping**: her read is a blocking synchronous HTTP call, and it's
+polled from `haptic_loop.py`'s asyncio loop at ~15Hz. Calling it directly
+would freeze the *entire* event loop -- every WebSocket, every background
+task, not just the haptic loop -- for up to her 0.5s timeout, on every
+single poll. `read_all_tof()` is now `async def`, wrapping the blocking
+call in `asyncio.to_thread()` so it runs off the event loop entirely.
+Every caller awaits it now: `haptic_loop.py` and
+`detection_input.attach_distance()`. `tests/test_tof_input.py` proves this
+empirically (not just by code inspection) -- it patches in an
+artificially slow read and confirms a concurrent counter coroutine keeps
+ticking throughout, rather than trusting that `asyncio.to_thread()` was
+used correctly.
+
+**None handling, end to end**: any of the three distances can be `None`.
+- `haptic_trigger.check_thresholds()` treats `None` as "not triggered,"
+  never compared against a threshold (which would raise) and never
+  treated as `0` or otherwise falsely close.
+- `detection_input.attach_distance()`: a direct left/right mapping passes
+  `None` straight through as "distance unknown." For `"center"` (min of
+  left/right), if exactly one side is `None` the other (known) value is
+  used; if both are `None`, the result is also `None`, never a fabricated
+  number.
+- `detection_input.should_escalate()` never escalates on an unknown
+  (`None`) distance -- escalating drives a real Gemini call and, via the
+  throttle, a spoken narration, and there's no real reading to justify
+  "this is close" with an unknown distance. The safer default is to not
+  escalate; nothing is lost long-term, since the next detection for the
+  same object is evaluated fresh once a real reading comes in.
+
+**The original mock is kept, not deleted** -- `tof_input.mock_read_all_tof()`
+(also `async def`, so it's a drop-in swap) -- for tests and any
+hardware-less development. Nothing in the active pipeline calls it anymore;
+import and use it explicitly if the real board isn't reachable.
+
+**Known stale side effect**: `server.py`'s `/simulate/tof/{direction}`
+demo endpoint and `tof_input.force_dip()` only manipulate
+`mock_read_all_tof()`'s internal state. Now that the active pipeline calls
+the real `read_all_tof()` instead, `/simulate/tof` no longer has any
+effect on live haptic/narration behavior -- it wasn't touched in this
+change (out of scope), but be aware it's now a no-op for its original
+purpose until/unless that endpoint is updated separately.
+
+**Manual test path**: with `BOARD_IP` reachable (on her hotspot), run the
+server and `test_haptic_client.py` as usual -- you should see real
+left/right/up readings driving haptic behavior instead of simulated dips.
+If "up" isn't wired up yet, confirm its `None` reading correctly means
+"up" never triggers, without affecting left/right or crashing anything
+else. If the board is unreachable entirely, every reading will be `None`
+(her code's own fallback) -- confirm haptics simply stay quiet rather than
+erroring.
+
+## Camera integration (still mocked -- out of scope for the ToF work above)
+
 - **Real camera detection feed**: `pipeline/detection_input.py`, replace
   `mock_detection_stream()` with a generator/async-generator from the real
-  OAK-1-AF pipeline, yielding dicts shaped
-  `{timestamp, object_class, direction, confidence}` (no distance -- see
-  above). Wire it into `pipeline/main.py`'s `run_pipeline()` in place of
-  the mock stream.
+  OAK-1-AF pipeline (`listen_events()`, being built separately), yielding
+  dicts shaped `{timestamp, object_class, direction, confidence}` (no
+  distance -- see above). Wire it into `pipeline/main.py`'s
+  `run_pipeline()` in place of the mock stream.
 - **Real camera frame**: `pipeline/detection_input.py`, replace
   `capture_frame()` with the real frame grab; keep the `-> bytes` (JPEG)
   signature so nothing downstream needs to change.
+
+Neither of these was touched by the 2026-07-19 ToF integration --
+`mock_detection_stream()`, `capture_frame()`, and `main.py`'s camera
+wiring are all intentionally untouched and still mock-driven, pending the
+teammate's separate camera integration work. `attach_distance()` (which
+sits between the two, mapping a camera detection's direction to a ToF
+reading) was updated for None-safety on the ToF side only, since it calls
+`tof_input.read_all_tof()` directly -- it does not otherwise assume
+anything about where the detection came from.
 
 ## Known mismatch with the current Swift app (flag for your teammate)
 

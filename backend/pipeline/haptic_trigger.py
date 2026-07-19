@@ -54,10 +54,17 @@ def check_thresholds(
 ) -> List[str]:
     """
     Given a {"left": ..., "right": ..., "up": ...} distance reading (as
-    returned by tof_input.read_all_tof()) and the list/set of directions
-    this function returned on the PREVIOUS call, returns the directions
-    currently triggered under hysteresis. Can be empty, one direction, or
-    all of them.
+    returned by tof_input.read_all_tof() -- each value a float, or None if
+    that sensor has no reading, e.g. not wired up yet) and the list/set of
+    directions this function returned on the PREVIOUS call, returns the
+    directions currently triggered under hysteresis. Can be empty, one
+    direction, or all of them.
+
+    A None reading is always treated as "not triggered," regardless of
+    previous state -- never compared against a threshold (which would
+    raise) and never treated as 0 or otherwise falsely close. A direction
+    that was triggered and then starts reading None (e.g. the board drops
+    out) correctly clears, same as if it had risen past clear_threshold_m.
 
     Call it like `triggered = check_thresholds(distances, triggered)` in a
     loop -- passing the previous return value back in is what gives
@@ -67,6 +74,8 @@ def check_thresholds(
     """
     triggered = []
     for direction, distance_m in distances.items():
+        if distance_m is None:
+            continue
         is_currently_triggered = direction in previously_triggered
         threshold = clear_threshold_m if is_currently_triggered else trigger_threshold_m
         if distance_m < threshold:

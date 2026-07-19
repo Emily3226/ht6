@@ -50,14 +50,22 @@ def should_escalate(detection: dict) -> bool:
     camera (OAK-1-AF) has no depth perception, so a raw camera detection
     has no distance_m of its own -- distance is sourced from ToF at
     detection-time, not carried by the camera.
+
+    distance_m may be None if attach_distance() couldn't get a real
+    reading (see its docstring) -- this never escalates on an unknown
+    distance. Escalating drives a real Gemini call and, via the throttle,
+    a spoken narration; with no real reading to back up "this is close,"
+    treating "unknown" as "close enough" risks narrating on fabricated
+    proximity. Nothing is lost long-term either -- the next detection for
+    the same object gets evaluated fresh once a real reading comes in.
     """
-    return (
-        detection["distance_m"] < DISTANCE_THRESHOLD_M
-        and detection["confidence"] > CONFIDENCE_THRESHOLD
-    )
+    distance_m = detection["distance_m"]
+    if distance_m is None:
+        return False
+    return distance_m < DISTANCE_THRESHOLD_M and detection["confidence"] > CONFIDENCE_THRESHOLD
 
 
-def attach_distance(detection: dict) -> dict:
+async def attach_distance(detection: dict) -> dict:
     """
     Stage 1 (pre-filter): attach a distance_m to a raw camera detection by
     looking up the current ToF reading for that detection's direction.
@@ -68,13 +76,29 @@ def attach_distance(detection: dict) -> dict:
     whichever of left/right is closer, since a straight-ahead obstacle
     would show up on at least one of the two forward-facing sensors.
 
+    None-safety: any ToF sensor can report None (no reading yet, or that
+    unit isn't wired up -- see tof_input.py). For a direct left/right
+    mapping, a None reading means distance is genuinely unknown, and is
+    passed through as None rather than fabricated -- should_escalate()
+    treats an unknown distance as "don't escalate." For "center" (min of
+    left/right): if exactly one of the two is None, the other (known)
+    value is used, since a real obstacle straight ahead would show up on
+    at least one working forward sensor; if BOTH are None, the result is
+    also None ("unknown"), never a fabricated number.
+
     Returns a new dict (does not mutate the input) with distance_m added
     alongside the original fields.
     """
-    tof = tof_input.read_all_tof()
+    tof = await tof_input.read_all_tof()
     direction = detection["direction"]
     if direction == "center":
-        distance_m = min(tof["left"], tof["right"])
+        left, right = tof["left"], tof["right"]
+        if left is None:
+            distance_m = right  # None if right is also None -- still "unknown"
+        elif right is None:
+            distance_m = left
+        else:
+            distance_m = min(left, right)
     else:
         distance_m = tof[direction]
     return {**detection, "distance_m": distance_m}

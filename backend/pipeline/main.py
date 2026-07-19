@@ -85,8 +85,9 @@ async def run_pipeline(simulate_crash: bool) -> None:
         detection = await asyncio.to_thread(next, stream)
 
         # The camera has no depth perception -- attach_distance() has to
-        # run before should_escalate() can even look at distance_m.
-        detection = attach_distance(detection)
+        # run before should_escalate() can even look at distance_m. Async
+        # now that it awaits the real (HTTP, off-thread) ToF read.
+        detection = await attach_distance(detection)
 
         if not should_escalate(detection):
             continue

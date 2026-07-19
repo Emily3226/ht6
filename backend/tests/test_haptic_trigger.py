@@ -95,3 +95,36 @@ def test_default_threshold_constants():
     assert TRIGGER_THRESHOLD_M == 0.75
     assert CLEAR_THRESHOLD_M == 0.90
     assert CLEAR_THRESHOLD_M > TRIGGER_THRESHOLD_M
+
+
+# ---------------------------------------------------------------------------
+# None handling: a real ToF sensor (as opposed to the mock) can report None
+# for a direction with no reading yet, or that isn't wired up at all (e.g.
+# "up" may never be connected). None must never be compared against a
+# threshold (which would raise) and must never be treated as 0 or
+# otherwise falsely close.
+# ---------------------------------------------------------------------------
+
+def test_all_none_distances_never_trigger():
+    assert check_thresholds({"left": None, "right": None, "up": None}) == []
+
+
+def test_mixed_none_and_float_only_float_can_trigger():
+    result = check_thresholds({"left": None, "right": 0.3, "up": None})
+    assert result == ["right"]
+
+
+def test_none_reading_does_not_crash_and_clears_a_previously_triggered_direction():
+    # A direction that was triggered and then starts reading None (e.g.
+    # the board drops that sensor) must clear -- same as if it had risen
+    # past clear_threshold_m -- not crash on a None comparison.
+    triggered = check_thresholds({"left": 0.5})
+    assert triggered == ["left"]
+
+    triggered = check_thresholds({"left": None}, triggered)
+    assert triggered == []
+
+
+def test_none_for_one_direction_does_not_affect_others():
+    result = check_thresholds({"left": None, "right": 0.4, "up": 0.5})
+    assert set(result) == {"right", "up"}

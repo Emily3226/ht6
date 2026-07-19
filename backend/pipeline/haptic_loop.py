@@ -62,7 +62,11 @@ async def run_haptic_loop(poll_interval_s: float = DEFAULT_POLL_INTERVAL_S) -> N
     # last cycle).
     triggered: list = []
     while True:
-        distances = tof_input.read_all_tof()
+        # read_all_tof() is a real (blocking, HTTP) hardware call wrapped
+        # in asyncio.to_thread() internally -- awaiting it here is safe
+        # and doesn't block this loop's own scheduling, or anything else
+        # on the event loop.
+        distances = await tof_input.read_all_tof()
         triggered = check_thresholds(distances, triggered)
 
         for direction in triggered:

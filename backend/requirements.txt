@@ -6,3 +6,4 @@ python-dotenv
 pillow
 pytest
 motor
+requests
