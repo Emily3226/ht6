@@ -71,6 +71,9 @@ class ConnectionManager:
         # through send_to() below, which serializes on this lock.
         self._locks: dict[WebSocket, asyncio.Lock] = {}
 
+    def has_clients(self) -> bool:
+        return bool(self._connections)
+
     async def connect(self, websocket: WebSocket) -> None:
         await websocket.accept()
         self._connections.append(websocket)

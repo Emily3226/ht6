@@ -67,6 +67,7 @@ struct ContentView: View {
     @State private var isScanning          = false
     @State private var isHardwareConnected = false
     @State private var sosErrorMessage: String?
+    @State private var autoSOSTask: Task<Void, Never>?
     @State private var smsCompose: SMSCompose?
 
     @StateObject private var voice = VoiceAssistantManager()
@@ -207,6 +208,7 @@ struct ContentView: View {
             phoneSession.onVoiceAudio = { data in voice.appendRemoteAudio(data) }
             phoneSession.onVoiceWake = { voice.wakeFromGesture() }
             phoneSession.onWatchScanRequest = { requestSceneDescription() }
+            phoneSession.onSOSCancel = { cancelAutoSOS() }
         }
         .onChange(of: voice.state) { pushVoiceStateToWatch() }
         .onChange(of: voice.transcript) {
@@ -385,9 +387,17 @@ struct ContentView: View {
             }
         }
 
-        // SOS is manual-only (hold button on the Safety tab or the watch):
-        // hazard detections — even high-urgency ones — narrate and haptic
-        // but never raise the SOS alert.
+        // Only the "urgent" tier raises the SOS overlay on the watch. The
+        // backend reserves it for life-threatening hazards (<1 m, allow-listed
+        // categories) — ordinary detections, including "high", just narrate
+        // and haptic. The watch overlay is a 5-second cancel window; the
+        // phone runs the authoritative timer and sends the real SOS (SMS +
+        // email gateway) unless the watch cancels in time.
+        if hazard.urgency == "urgent" {
+            phoneSession.sendSOSAlert()
+            scheduleAutoSOS()
+        }
+
         guard settings.audioEnabled else { return }
         Task { await speakAndPlay(hazard.spokenDescription) }
     }
@@ -419,14 +429,35 @@ struct ContentView: View {
         Task { await fireSOS() }
     }
 
-    private func fireSOS() async {
+    /// Urgent-hazard SOS: mirrors the watch overlay's 5-second countdown
+    /// (plus 1s of slack so a last-instant cancel tap wins the race), then
+    /// fires the real SOS. The watch's cancel button lands in cancelAutoSOS()
+    /// via PhoneSessionManager.onSOSCancel.
+    private func scheduleAutoSOS() {
+        autoSOSTask?.cancel()
+        autoSOSTask = Task {
+            try? await Task.sleep(for: .seconds(6))
+            guard !Task.isCancelled else { return }
+            autoSOSTask = nil
+            await fireSOS(auto: true)
+        }
+    }
+
+    private func cancelAutoSOS() {
+        autoSOSTask?.cancel()
+        autoSOSTask = nil
+    }
+
+    private func fireSOS(auto: Bool = false) async {
         do {
             let location = try await sosManager.requestLocation()
 
-            // Attach this location snapshot to a fresh "manual SOS" History
-            // entry — SOS only ever comes from the hold button now.
+            // Attach this location snapshot to a History entry labeled by
+            // what actually triggered the SOS.
             let incidentId = incidents.log(
-                hazardType: "manual_sos", direction: "-", urgency: "high"
+                hazardType: auto ? (lastHazard?.hazardType ?? "hazard") : "manual_sos",
+                direction:  auto ? (lastHazard?.direction.rawValue ?? "-") : "-",
+                urgency: "high"
             )
             incidents.attachLocation(location, toIncidentWithId: incidentId)
 
@@ -450,16 +481,27 @@ struct ContentView: View {
                 smsCompose = SMSCompose(recipients: numbers, body: messageBody)
             }
 
-            // Real delivery: server-side Resend → carrier-SMS-gateway send
-            // via the Vercel /api/sos endpoint. Throws with the server's
-            // per-recipient failure detail if nothing could be sent.
-            try await BackendClient.shared.sendSOS(
-                contactGatewayAddresses: contacts.map(\.smsGatewayAddress),
-                location: location,
-                hazardType: "manual_sos",
-                direction: "-",
-                urgency: "high"
-            )
+            // Redundant delivery: server-side Resend → carrier-SMS-gateway
+            // send via the Vercel /api/sos endpoint. This is a backup
+            // channel — if the Mac relay (or the compose-sheet fallback)
+            // already got the message out, a failure here is logged but
+            // doesn't deserve an alert. Only surface it when every other
+            // channel also failed, i.e. nothing was actually sent.
+            do {
+                try await BackendClient.shared.sendSOS(
+                    contactGatewayAddresses: contacts.map(\.smsGatewayAddress),
+                    location: location,
+                    hazardType: auto ? (lastHazard?.hazardType ?? "hazard") : "manual_sos",
+                    direction: auto ? (lastHazard?.direction.rawValue ?? "-") : "-",
+                    urgency: "high"
+                )
+            } catch {
+                if !relayedToAll && !SMSComposeView.canSend {
+                    sosErrorMessage = error.localizedDescription
+                } else {
+                    print("SOS gateway send failed (already delivered via relay/compose): \(error)")
+                }
+            }
 
             // Best-effort: SOS event document in Atlas, plus a live location
             // trail patched onto it every ~90s while the SOS stays active.
