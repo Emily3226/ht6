@@ -55,7 +55,7 @@ from pipeline.detection_input import (
 )
 from pipeline.haptic_loop import run_haptic_loop
 from pipeline.narration_worker import run_narration_worker
-from pipeline.server import DEFAULT_PORT, app, get_local_ip
+from pipeline.server import DEFAULT_PORT, app, broadcast_hazard, get_local_ip, manager
 from pipeline.status_loop import run_status_loop
 from pipeline.throttle import HazardThrottle
 
@@ -103,6 +103,33 @@ async def run_pipeline(simulate_crash: bool) -> None:
         narration_queue.push_nowait({"source": "camera", "detection": detection, "frame": frame})
 
 
+# The mock data never produces an "urgent" hazard on its own: the overhead
+# template path tops out at "high", and gemini_stage's urgent gate would
+# downgrade anything the fake gray frames produced anyway. Since "urgent" is
+# the one tier that raises the SOS overlay on the watch, this one-shot task
+# scripts it: as soon as the first Swift client connects to /ws/hazards,
+# broadcast a single urgent hazard so the SOS flow leads the demo. The short
+# delay just gives the app a beat to finish setting up after connecting;
+# it's well under the mock stream's own pacing + Gemini latency, so this is
+# effectively always the first hazard the app hears.
+URGENT_DEMO_DELAY_S = 2.0
+
+URGENT_DEMO_HAZARD = {
+    "hazard_type": "vehicle",
+    "direction": "center",
+    "urgency": "urgent",
+    "spoken_description": "Danger. Vehicle approaching directly ahead. Move back now.",
+}
+
+
+async def run_urgent_demo_once() -> None:
+    while not manager.has_clients():
+        await asyncio.sleep(0.5)
+    await asyncio.sleep(URGENT_DEMO_DELAY_S)
+    await broadcast_hazard(URGENT_DEMO_HAZARD)
+    logger.info("Urgent demo hazard broadcast: %s", URGENT_DEMO_HAZARD)
+
+
 def _resolve_simulate_crash(cli_flag: bool) -> bool:
     if cli_flag:
         return True
@@ -146,6 +173,7 @@ def main() -> None:
         run_haptic_loop,
         lambda: run_narration_worker(throttle),
         run_status_loop,
+        run_urgent_demo_once,
     ]
 
     local_ip = get_local_ip()
@@ -153,6 +181,7 @@ def main() -> None:
     print(f"Swift app should connect to: ws://{local_ip}:{DEFAULT_PORT}/ws/hazards")
     print(f"Haptic reflex path:  ws://{local_ip}:{DEFAULT_PORT}/ws/haptics")
     print(f"Camera status path:  ws://{local_ip}:{DEFAULT_PORT}/ws/status")
+    print(f"SOS demo: one URGENT hazard fires first, ~{URGENT_DEMO_DELAY_S:.0f}s after the app connects.")
     if app.state.simulate_crash:
         print("CRASH SIMULATION MODE enabled -- sustained chaotic hazard stream for ~2 minutes.")
 

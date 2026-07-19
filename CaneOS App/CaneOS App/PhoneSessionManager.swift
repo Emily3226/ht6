@@ -16,6 +16,8 @@ final class PhoneSessionManager: NSObject, ObservableObject, WCSessionDelegate {
     var onVoiceControl: ((String) -> Void)?
     /// Raw Watch-mic audio chunks (16 kHz mono Int16 PCM).
     var onVoiceAudio: ((Data) -> Void)?
+    /// Watch cancelled the SOS countdown (cancel button on the overlay).
+    var onSOSCancel: (() -> Void)?
 
     private override init() {
         super.init()
@@ -81,6 +83,10 @@ final class PhoneSessionManager: NSObject, ObservableObject, WCSessionDelegate {
             DispatchQueue.main.async { self.onVoiceControl?(control) }
             return
         }
+        if message["type"] as? String == "sos_cancel" {
+            DispatchQueue.main.async { self.onSOSCancel?() }
+            return
+        }
         guard let command = message["command"] as? String else { return }
         DispatchQueue.main.async {
             switch command {
@@ -88,6 +94,14 @@ final class PhoneSessionManager: NSObject, ObservableObject, WCSessionDelegate {
             case "scan_now":   self.onWatchScanRequest?()
             default: break
             }
+        }
+    }
+
+    /// Fallback delivery path: the Watch sends sos_cancel via
+    /// transferUserInfo when it isn't "reachable" -- still honor it.
+    func session(_ session: WCSession, didReceiveUserInfo userInfo: [String: Any] = [:]) {
+        if userInfo["type"] as? String == "sos_cancel" {
+            DispatchQueue.main.async { self.onSOSCancel?() }
         }
     }
 
@@ -100,6 +114,15 @@ final class PhoneSessionManager: NSObject, ObservableObject, WCSessionDelegate {
     func sendVoiceUpdate(_ payload: [String: Any]) {
         guard WCSession.default.isReachable else { return }
         WCSession.default.sendMessage(payload, replyHandler: nil)
+    }
+
+    /// Ships synthesized answer audio (MP3) to the Watch for playback there.
+    /// Returns false when the Watch isn't reachable so the caller can fall
+    /// back to phone playback.
+    func sendAnswerAudio(_ data: Data) -> Bool {
+        guard WCSession.default.isReachable else { return false }
+        WCSession.default.sendMessageData(data, replyHandler: nil, errorHandler: nil)
+        return true
     }
 
     func session(_ session: WCSession, activationDidCompleteWith state: WCSessionActivationState, error: Error?) {

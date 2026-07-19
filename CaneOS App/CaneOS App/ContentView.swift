@@ -67,8 +67,7 @@ struct ContentView: View {
     @State private var isScanning          = false
     @State private var isHardwareConnected = false
     @State private var sosErrorMessage: String?
-    @State private var pendingSOSIncidentId: UUID?
-    @State private var lastSOSAt: Date?
+    @State private var autoSOSTask: Task<Void, Never>?
     @State private var smsCompose: SMSCompose?
 
     @StateObject private var voice = VoiceAssistantManager()
@@ -76,6 +75,8 @@ struct ContentView: View {
     /// Set while a question is in flight; cleared by answer, timeout, or
     /// cancel — a late answer after cancel is discarded.
     @State private var awaitingAnswer = false
+    /// The question was spoken into the Watch — play the answer there too.
+    @State private var answerTargetIsWatch = false
 
     /// Stable per-install session id sent with every voice question so the
     /// backend can keep per-user conversation context.
@@ -207,6 +208,7 @@ struct ContentView: View {
             phoneSession.onVoiceAudio = { data in voice.appendRemoteAudio(data) }
             phoneSession.onVoiceWake = { voice.wakeFromGesture() }
             phoneSession.onWatchScanRequest = { requestSceneDescription() }
+            phoneSession.onSOSCancel = { cancelAutoSOS() }
         }
         .onChange(of: voice.state) { pushVoiceStateToWatch() }
         .onChange(of: voice.transcript) {
@@ -254,7 +256,7 @@ struct ContentView: View {
         }
         hapticsConnection.connect(to: Config.hapticsWebSocketURL)
 
-        // /ws/hazards: richer, backend-throttled. Drives the UI, TTS, SOS,
+        // /ws/hazards: richer, backend-throttled. Drives the UI, TTS,
         // and incident history.
         hazardsConnection.onConnectionChange = { connected in
             isHardwareConnected = connected
@@ -298,6 +300,7 @@ struct ContentView: View {
     /// The answer is spoken verbatim via ElevenLabs in handleVoiceAnswer.
     private func processVoiceCommand(_ question: String) {
         awaitingAnswer = true
+        answerTargetIsWatch = voice.lastCaptureFromWatch
         hazardsConnection.send([
             "question": question,
             "session_id": Self.voiceSessionId
@@ -312,7 +315,7 @@ struct ContentView: View {
             let fallback = "Sorry, I didn't get an answer from the backend."
             voice.lastReply = fallback
             voice.finishedThinking()
-            await speakAndPlay(fallback)
+            await deliverAnswerAudio(fallback)
         }
     }
 
@@ -326,7 +329,22 @@ struct ContentView: View {
         voice.lastReply = text
         voice.finishedThinking()
         phoneSession.sendVoiceUpdate(["voiceReply": text])
-        Task { await speakAndPlay(text) }
+        Task { await deliverAnswerAudio(text) }
+    }
+
+    /// Synthesizes the answer with ElevenLabs and plays it where the
+    /// question was asked: on the Watch when it came from the Watch mic
+    /// (falling back to the phone if the Watch drops), else on the phone.
+    private func deliverAnswerAudio(_ text: String) async {
+        do {
+            let audio = try await elevenLabs.synthesize(text: text)
+            if answerTargetIsWatch, phoneSession.sendAnswerAudio(audio) {
+                return
+            }
+            AudioPlaybackManager.shared.play(audio)
+        } catch {
+            print("ElevenLabs synthesis failed: \(error.localizedDescription)")
+        }
     }
 
     /// Cancel from the Watch (pinch/button while thinking) or the phone's
@@ -359,39 +377,29 @@ struct ContentView: View {
             urgency:    hazard.urgency
         )
 
-        if hazard.urgency == "high" {
-            // High-urgency hazards trigger the SOS flow, which fetches location
-            // anyway to send with the alert -- reuse that fetch for the incident's
-            // location snapshot instead of requesting location twice.
-            pendingSOSIncidentId = incidentId
-        } else {
-            // Best-effort geolocation snapshot for the History entry. Failures
-            // here (permission denied, no fix yet) are expected and non-fatal,
-            // so we stay silent rather than alerting for every logged incident.
-            Task {
-                if let location = try? await sosManager.requestLocation() {
-                    incidents.attachLocation(location, toIncidentWithId: incidentId)
-                    await announceRepeatHazardIfAny(hazard, at: location, incidentId: incidentId)
-                }
+        // Best-effort geolocation snapshot for the History entry. Failures
+        // here (permission denied, no fix yet) are expected and non-fatal,
+        // so we stay silent rather than alerting for every logged incident.
+        Task {
+            if let location = try? await sosManager.requestLocation() {
+                incidents.attachLocation(location, toIncidentWithId: incidentId)
+                await announceRepeatHazardIfAny(hazard, at: location, incidentId: incidentId)
             }
         }
 
-        guard settings.audioEnabled else { return }
-        let desc = hazard.spokenDescription
-
-        if hazard.urgency == "high" {
-            // TTS and SOS fire in parallel — no countdown; the alert goes
-            // out immediately while the narration plays.
+        // Only the "urgent" tier raises the SOS overlay on the watch. The
+        // backend reserves it for life-threatening hazards (<1 m, allow-listed
+        // categories) — ordinary detections, including "high", just narrate
+        // and haptic. The watch overlay is a 5-second cancel window; the
+        // phone runs the authoritative timer and sends the real SOS (SMS +
+        // email gateway) unless the watch cancels in time.
+        if hazard.urgency == "urgent" {
             phoneSession.sendSOSAlert()
-            // Auto-firing SOS/SMS on every high-danger classification is
-            // disabled for now -- SMS should only go out from the manual
-            // hold-button (fireManualSOS). Uncomment the line below to
-            // restore automatic SMS on high-danger hazards.
-            // autoFireSOS()
-            Task { await speakAndPlay(desc) }
-        } else {
-            Task { await speakAndPlay(desc) }
+            scheduleAutoSOS()
         }
+
+        guard settings.audioEnabled else { return }
+        Task { await speakAndPlay(hazard.spokenDescription) }
     }
 
     /// Checks Atlas ($geoNear on the incident log) for past incidents of the
@@ -421,31 +429,37 @@ struct ContentView: View {
         Task { await fireSOS() }
     }
 
-    /// Hazard-triggered SOS: also fires immediately (no countdown), but at
-    /// most once every 2 minutes so a burst of high-urgency detections
-    /// can't spam the emergency contacts with repeated alerts.
-    ///
-    /// Currently unused -- kept here (and the call site above, commented
-    /// out) in case automatic SMS-on-high-danger is wanted again later.
-    // private func autoFireSOS() {
-    //     if let last = lastSOSAt, Date().timeIntervalSince(last) < 120 { return }
-    //     Task { await fireSOS() }
-    // }
+    /// Urgent-hazard SOS: mirrors the watch overlay's 5-second countdown
+    /// (plus 1s of slack so a last-instant cancel tap wins the race), then
+    /// fires the real SOS. The watch's cancel button lands in cancelAutoSOS()
+    /// via PhoneSessionManager.onSOSCancel.
+    private func scheduleAutoSOS() {
+        autoSOSTask?.cancel()
+        autoSOSTask = Task {
+            try? await Task.sleep(for: .seconds(6))
+            guard !Task.isCancelled else { return }
+            autoSOSTask = nil
+            await fireSOS(auto: true)
+        }
+    }
 
-    private func fireSOS() async {
-        lastSOSAt = Date()
+    private func cancelAutoSOS() {
+        autoSOSTask?.cancel()
+        autoSOSTask = nil
+    }
+
+    private func fireSOS(auto: Bool = false) async {
         do {
             let location = try await sosManager.requestLocation()
 
-            // Attach this location snapshot to History: either the hazard
-            // incident that triggered this SOS, or (for a manually-held SOS
-            // button with no preceding hazard) a fresh "manual SOS" entry.
-            let isAutoTriggered = pendingSOSIncidentId != nil
-            let incidentId = pendingSOSIncidentId ?? incidents.log(
-                hazardType: "manual_sos", direction: "-", urgency: "high"
+            // Attach this location snapshot to a History entry labeled by
+            // what actually triggered the SOS.
+            let incidentId = incidents.log(
+                hazardType: auto ? (lastHazard?.hazardType ?? "hazard") : "manual_sos",
+                direction:  auto ? (lastHazard?.direction.rawValue ?? "-") : "-",
+                urgency: "high"
             )
             incidents.attachLocation(location, toIncidentWithId: incidentId)
-            pendingSOSIncidentId = nil
 
             let contacts = contactsManager.contacts
             guard !contacts.isEmpty else {
@@ -467,16 +481,27 @@ struct ContentView: View {
                 smsCompose = SMSCompose(recipients: numbers, body: messageBody)
             }
 
-            // Real delivery: server-side Resend → carrier-SMS-gateway send
-            // via the Vercel /api/sos endpoint. Throws with the server's
-            // per-recipient failure detail if nothing could be sent.
-            try await BackendClient.shared.sendSOS(
-                contactGatewayAddresses: contacts.map(\.smsGatewayAddress),
-                location: location,
-                hazardType: isAutoTriggered ? (lastHazard?.hazardType ?? "hazard") : "manual_sos",
-                direction: isAutoTriggered ? (lastHazard?.direction.rawValue ?? "-") : "-",
-                urgency: "high"
-            )
+            // Redundant delivery: server-side Resend → carrier-SMS-gateway
+            // send via the Vercel /api/sos endpoint. This is a backup
+            // channel — if the Mac relay (or the compose-sheet fallback)
+            // already got the message out, a failure here is logged but
+            // doesn't deserve an alert. Only surface it when every other
+            // channel also failed, i.e. nothing was actually sent.
+            do {
+                try await BackendClient.shared.sendSOS(
+                    contactGatewayAddresses: contacts.map(\.smsGatewayAddress),
+                    location: location,
+                    hazardType: auto ? (lastHazard?.hazardType ?? "hazard") : "manual_sos",
+                    direction: auto ? (lastHazard?.direction.rawValue ?? "-") : "-",
+                    urgency: "high"
+                )
+            } catch {
+                if !relayedToAll && !SMSComposeView.canSend {
+                    sosErrorMessage = error.localizedDescription
+                } else {
+                    print("SOS gateway send failed (already delivered via relay/compose): \(error)")
+                }
+            }
 
             // Best-effort: SOS event document in Atlas, plus a live location
             // trail patched onto it every ~90s while the SOS stays active.
@@ -1807,6 +1832,7 @@ struct HistoryView: View {
     @ObservedObject private var auth = AuthManager.shared
     @Environment(\.openURL) private var openURL
     @State private var insights: IncidentStore.Insights?
+    @State private var showClearConfirm = false
 
     private static let formatter: DateFormatter = {
         let f = DateFormatter()
@@ -1860,6 +1886,25 @@ struct HistoryView: View {
                         .accessibilityLabel("Edit incident history")
                 }
             }
+            ToolbarItem(placement: .navigationBarTrailing) {
+                if !store.incidents.isEmpty {
+                    Button { showClearConfirm = true } label: {
+                        Image(systemName: "trash")
+                            .foregroundColor(.red)
+                    }
+                    .accessibilityLabel("Clear all incidents")
+                }
+            }
+        }
+        .confirmationDialog(
+            "Delete all \(store.incidents.count) incidents? This also removes them from the cloud.",
+            isPresented: $showClearConfirm,
+            titleVisibility: .visible
+        ) {
+            Button("Delete All", role: .destructive) {
+                Task { await store.clearAll() }
+            }
+            Button("Cancel", role: .cancel) {}
         }
     }
 
@@ -2027,7 +2072,7 @@ struct IncidentLocationSnapshot: View {
             span: MKCoordinateSpan(latitudeDelta: 0.01, longitudeDelta: 0.01)
         )
         options.size = size
-        options.scale = UIScreen.main.scale
+        options.scale = UITraitCollection.current.displayScale
         options.showsBuildings = false
 
         let snapshotter = MKMapSnapshotter(options: options)

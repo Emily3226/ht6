@@ -69,6 +69,12 @@ final class WatchSessionManager: NSObject, ObservableObject, WCSessionDelegate {
         handle(message)
     }
 
+    /// Binary payloads from the phone are always answer audio (MP3) —
+    /// mic audio only ever flows the other direction.
+    func session(_ session: WCSession, didReceiveMessageData messageData: Data) {
+        WatchVoiceManager.shared.playAnswer(messageData)
+    }
+
     func session(_ session: WCSession, didReceiveUserInfo userInfo: [String: Any]) {
         handle(userInfo)
     }
