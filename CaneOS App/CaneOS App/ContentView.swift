@@ -70,6 +70,7 @@ struct ContentView: View {
     @State private var autoSOSTask: Task<Void, Never>?
     @State private var activeBuzz: HapticSensorDirection?
     @State private var buzzClearTask: Task<Void, Never>?
+    @State private var lastAutoSOSAt: Date?
     @State private var smsCompose: SMSCompose?
 
     @StateObject private var voice = VoiceAssistantManager()
@@ -412,7 +413,9 @@ struct ContentView: View {
         // and haptic. The watch overlay is a 5-second cancel window; the
         // phone runs the authoritative timer and sends the real SOS (SMS +
         // email gateway) unless the watch cancels in time.
-        if hazard.urgency == "urgent" {
+        // The 2-minute cooldown gates the overlay too — showing a countdown
+        // whose SOS is cooldown-suppressed would be a lie.
+        if hazard.urgency == "urgent" && autoSOSAvailable {
             phoneSession.sendSOSAlert()
             scheduleAutoSOS()
         }
@@ -452,12 +455,23 @@ struct ContentView: View {
     /// (plus 1s of slack so a last-instant cancel tap wins the race), then
     /// fires the real SOS. The watch's cancel button lands in cancelAutoSOS()
     /// via PhoneSessionManager.onSOSCancel.
+    /// At most one auto-SOS per 2 minutes: a burst of urgent
+    /// classifications (e.g. sensors blocked on a table during setup)
+    /// must not text the emergency contacts once per detection. The
+    /// manual hold button deliberately bypasses this.
+    private var autoSOSAvailable: Bool {
+        guard let last = lastAutoSOSAt else { return true }
+        return Date().timeIntervalSince(last) >= 120
+    }
+
     private func scheduleAutoSOS() {
+        guard autoSOSAvailable else { return }
         autoSOSTask?.cancel()
         autoSOSTask = Task {
             try? await Task.sleep(for: .seconds(6))
             guard !Task.isCancelled else { return }
             autoSOSTask = nil
+            lastAutoSOSAt = Date()
             await fireSOS(auto: true)
         }
     }
