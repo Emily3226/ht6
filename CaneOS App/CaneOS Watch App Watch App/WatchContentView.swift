@@ -105,9 +105,28 @@ struct WatchMainView: View {
                 }
                 .frame(width: 130, height: 130)
                 .buttonStyle(.plain)
-                .handGestureShortcut(.primaryAction) // Double Tap on Watch S9+
                 .accessibilityLabel("Scan environment, what's around me")
-                .accessibilityHint("Triggers spoken audio description of surroundings. Also activatable with double tap gesture.")
+                .accessibilityHint("Triggers spoken audio description of surroundings")
+
+                // Ask Cane — the Double Tap (double pinch) gesture lands here,
+                // waking the phone's voice assistant hands-free.
+                Button(action: session.requestVoiceWake) {
+                    HStack(spacing: 5) {
+                        Image(systemName: "mic.fill")
+                            .font(.system(size: 11, weight: .bold))
+                        Text("Ask Cane")
+                            .font(.system(size: 11, weight: .bold))
+                    }
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .background(Color(red: 0.12, green: 0.46, blue: 1.00).opacity(0.35))
+                    .cornerRadius(10)
+                }
+                .buttonStyle(.plain)
+                .handGestureShortcut(.primaryAction) // Double Tap (pinch ×2) on S9+
+                .accessibilityLabel("Ask Cane by voice")
+                .accessibilityHint("Double pinch your fingers or tap, then speak to your phone")
 
                 // Last hazard direction
                 if session.lastDirection != "-" {

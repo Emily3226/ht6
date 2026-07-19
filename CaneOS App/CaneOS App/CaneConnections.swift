@@ -81,15 +81,19 @@ final class CaneSocketConnection<Message: Decodable>: NSObject, URLSessionWebSoc
         }
     }
 
-    // Used by the on-demand "what's around me" button to ask the backend for
+    // Used by the on-demand "what's around me" flows to ask the backend for
     // a fresh, broader scene scan. Only meaningful on the /ws/hazards socket.
     func sendCommand(_ command: String) {
-        let payload = ["command": command]
+        send(["command": command])
+    }
+
+    /// Sends an arbitrary JSON object as a text frame.
+    func send(_ payload: [String: Any]) {
         guard let data = try? JSONSerialization.data(withJSONObject: payload),
               let text = String(data: data, encoding: .utf8) else { return }
         webSocketTask?.send(.string(text)) { error in
             if let error {
-                print("Failed to send command: \(error.localizedDescription)")
+                print("Failed to send payload: \(error.localizedDescription)")
             }
         }
     }

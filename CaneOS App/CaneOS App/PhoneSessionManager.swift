@@ -8,6 +8,11 @@ final class PhoneSessionManager: NSObject, ObservableObject, WCSessionDelegate {
     @Published var isWatchConnected = false
     @Published var isWatchReachable = false
 
+    /// Watch → phone requests (set by ContentView). wake_voice comes from the
+    /// double-pinch gesture; scan_now from the Watch's scan button.
+    var onVoiceWake: (() -> Void)?
+    var onWatchScanRequest: (() -> Void)?
+
     private override init() {
         super.init()
         if WCSession.isSupported() {
@@ -66,6 +71,18 @@ final class PhoneSessionManager: NSObject, ObservableObject, WCSessionDelegate {
     }
 
     // MARK: WCSessionDelegate
+
+    func session(_ session: WCSession, didReceiveMessage message: [String: Any]) {
+        guard let command = message["command"] as? String else { return }
+        DispatchQueue.main.async {
+            switch command {
+            case "wake_voice": self.onVoiceWake?()
+            case "scan_now":   self.onWatchScanRequest?()
+            default: break
+            }
+        }
+    }
+
     func session(_ session: WCSession, activationDidCompleteWith state: WCSessionActivationState, error: Error?) {
         DispatchQueue.main.async {
             self.isWatchConnected = session.isPaired && session.isWatchAppInstalled

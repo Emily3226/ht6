@@ -367,6 +367,8 @@
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = "CaneOS-App-Info.plist";
 				INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = "CaneOS uses your location to include it in the emergency SOS alert sent to your contacts.";
+				INFOPLIST_KEY_NSMicrophoneUsageDescription = "CaneOS uses the microphone so you can ask questions and request scans by voice.";
+				INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "CaneOS transcribes your voice requests on-device in order to answer them.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
@@ -401,6 +403,8 @@
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = "CaneOS-App-Info.plist";
 				INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = "CaneOS uses your location to include it in the emergency SOS alert sent to your contacts.";
+				INFOPLIST_KEY_NSMicrophoneUsageDescription = "CaneOS uses the microphone so you can ask questions and request scans by voice.";
+				INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "CaneOS transcribes your voice requests on-device in order to answer them.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;

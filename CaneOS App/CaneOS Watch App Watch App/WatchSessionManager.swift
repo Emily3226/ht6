@@ -37,6 +37,18 @@ final class WatchSessionManager: NSObject, ObservableObject, WCSessionDelegate {
         WKInterfaceDevice.current().play(.click)
     }
 
+    /// Double-pinch (system Double Tap gesture) → wake the phone's voice
+    /// assistant so the user can just start talking. Distinct haptics
+    /// confirm whether the phone actually got the request.
+    func requestVoiceWake() {
+        if WCSession.default.isReachable {
+            WCSession.default.sendMessage(["command": "wake_voice"], replyHandler: nil)
+            WKInterfaceDevice.current().play(.start)
+        } else {
+            WKInterfaceDevice.current().play(.failure)
+        }
+    }
+
     func cancelSOS() {
         sosActive = false
         let msg: [String: Any] = ["type": "sos_cancel"]

@@ -71,6 +71,11 @@ struct ContentView: View {
     @State private var lastSOSAt: Date?
     @State private var smsCompose: SMSCompose?
 
+    @StateObject private var voice = VoiceAssistantManager()
+    /// Set when a voice request asked for a scan — the incoming
+    /// scene_description gets answered against this question.
+    @State private var pendingVoiceQuestion: String?
+
     private let elevenLabs = ElevenLabsClient(apiKey: Config.elevenLabsAPIKey, voiceId: Config.elevenLabsVoiceId)
     private let backboard  = BackboardClient(apiKey: Config.backboardAPIKey)
 
@@ -111,6 +116,8 @@ struct ContentView: View {
                     isWatchConnected: phoneSession.isWatchConnected,
                     lastHazard: lastHazard,
                     cameraStatus: cameraStatus,
+                    voice: voice,
+                    onVoiceTap: handleVoiceTap,
                     onRefresh: { phoneSession.refreshWatchReachability() }
                 )
                 .navigationBarTitleDisplayMode(.inline)
@@ -145,14 +152,13 @@ struct ContentView: View {
                     settings: settings,
                     auth: auth,
                     isScanning: isScanning,
-                    onScan: requestSceneDescription,
+                    onScan: { requestSceneDescription() },
                     onTestHaptic: { direction in
                         phoneSession.sendHaptic(direction)
                         // Spoken cue alongside the buzz — also doubles as a
                         // live test of the ElevenLabs → playback pipeline.
                         Task { await speakAndPlay(direction.rawValue.capitalized) }
-                    },
-                    onSimulate: simulateBackendEvent
+                    }
                 )
                 .navigationTitle("Settings")
             }
@@ -174,6 +180,12 @@ struct ContentView: View {
         .onAppear {
             connectToBackend()
             syncLocationSharing()
+            // Hands-free voice: listen for "Hey Cane" whenever the app is up,
+            // and let the Watch's double-pinch gesture wake capture directly.
+            voice.onCommand = { command in processVoiceCommand(command) }
+            voice.startWakeWord()
+            phoneSession.onVoiceWake = { voice.wakeFromGesture() }
+            phoneSession.onWatchScanRequest = { requestSceneDescription() }
         }
         .sheet(item: $smsCompose) { compose in
             SMSComposeView(compose: compose) { smsCompose = nil }
@@ -242,9 +254,55 @@ struct ContentView: View {
         statusConnection.connect(to: Config.statusWebSocketURL)
     }
 
+    // MARK: - Voice assistant ("Ask Cane")
+
+    private func handleVoiceTap() {
+        voice.manualToggle()
+    }
+
+    /// Routes a finished voice request: scan intents go to the Python
+    /// backend (with the spoken text attached); everything else is answered
+    /// by Backboard from memory.
+    private func processVoiceCommand(_ question: String) {
+        if VoiceAssistantManager.isScanIntent(question) {
+            pendingVoiceQuestion = question
+            requestSceneDescription(question: question)
+        } else {
+            Task { await answerVoiceQuestion(question) }
+        }
+    }
+
+    /// Non-scan questions ("what's happening right now?", anything): answered
+    /// by Backboard using its thread memory plus the recent-events context.
+    private func answerVoiceQuestion(_ question: String) async {
+        let prompt = """
+        You are CaneOS, a voice assistant for a blind cane user. Recent events \
+        the system detected (newest first):
+        \(voice.contextBlock())
+
+        The user asked: "\(question)"
+
+        Answer in one or two short spoken sentences. Use the events and our \
+        conversation history for context, and don't repeat details you've \
+        already told them unless they ask again.
+        """
+        do {
+            let reply = try await backboard.send(text: prompt)
+            voice.lastReply = reply
+            voice.finishedThinking()
+            await speakAndPlay(reply)
+        } catch {
+            voice.finishedThinking()
+            let fallback = "Sorry, I couldn't reach my memory right now."
+            voice.lastReply = fallback
+            await speakAndPlay(fallback)
+        }
+    }
+
     private func handleHazard(_ hazard: HazardMessage) {
         lastHazard = hazard
         isScanning = false
+        voice.recordEvent("Hazard: \(hazard.hazardType.replacingOccurrences(of: "_", with: " ")) to the \(hazard.direction.rawValue), \(hazard.urgency) urgency — \"\(hazard.spokenDescription)\"")
         let incidentId = incidents.log(
             hazardType: hazard.hazardType,
             direction:  hazard.direction.rawValue,
@@ -413,37 +471,39 @@ struct ContentView: View {
         }
     }
 
-    /// Asks the Python backend to fake a ToF sensor event. The backend
-    /// forces a dip on that mock sensor and (for left/right) queues a fake
-    /// camera detection, so the buzz and the plain-English narration arrive
-    /// back through the real WebSocket pipeline — a full end-to-end
-    /// rehearsal with nothing stubbed on the app side.
-    private func simulateBackendEvent(_ direction: HapticSensorDirection) async -> Bool {
-        guard let url = URL(string: "\(Config.pipelineBaseURL)/simulate/tof/\(direction.rawValue)") else {
-            return false
-        }
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        do {
-            let (_, response) = try await URLSession.shared.data(for: request)
-            return (response as? HTTPURLResponse)?.statusCode == 200
-        } catch {
-            print("[Simulate] request failed: \(error.localizedDescription)")
-            return false
-        }
-    }
-
-    private func requestSceneDescription() {
+    /// Asks the Python backend for a camera scan over /ws/hazards.
+    /// Payload contract (see backend README): {"command": "scan_now",
+    /// "question": "<the user's transcribed words, or empty string>"}.
+    private func requestSceneDescription(question: String? = nil) {
         isScanning = true
-        hazardsConnection.sendCommand("scan_now")
+        hazardsConnection.send([
+            "command": "scan_now",
+            "question": question ?? ""
+        ])
     }
 
     private func handleSceneDescription(_ text: String) async {
         isScanning = false
+        voice.recordEvent("Camera scan result: \(text)")
+
+        let question = pendingVoiceQuestion
+        pendingVoiceQuestion = nil
+        let prompt = """
+        You are CaneOS, a voice assistant for a blind cane user. A fresh \
+        camera scan just returned: "\(text)"
+        \(question.map { "The user asked: \"\($0)\"" } ?? "The user requested this scan.")
+
+        Describe the scene in one or two short spoken sentences, focusing on \
+        what's new or changed versus what you've already told them in this \
+        conversation — don't repeat unchanged details.
+        """
         do {
-            let reply = try await backboard.send(text: text)
+            let reply = try await backboard.send(text: prompt)
+            voice.lastReply = reply
+            voice.finishedThinking()
             await speakAndPlay(reply)
         } catch {
+            voice.finishedThinking()
             await speakAndPlay(text)
         }
     }
@@ -465,7 +525,11 @@ struct HomeView: View {
     let isWatchConnected: Bool
     let lastHazard: HazardMessage?
     let cameraStatus: CameraStatusEvent?
+    @ObservedObject var voice: VoiceAssistantManager
+    let onVoiceTap: () -> Void
     let onRefresh: () async -> Void
+
+    @State private var micPulse = false
 
     var body: some View {
         ZStack {
@@ -473,6 +537,7 @@ struct HomeView: View {
             ScrollView {
                 VStack(spacing: 20) {
                     statusCard
+                    voiceCard
                     watchPill
                     if cameraStatus == .cameraOffline { cameraOfflinePill }
                     if let hazard = lastHazard { lastAlertCard(hazard) }
@@ -480,6 +545,114 @@ struct HomeView: View {
                 .padding()
             }
             .refreshable { await onRefresh() }
+        }
+    }
+
+    // MARK: Ask CaneOS (voice assistant)
+
+    private var voiceCard: some View {
+        VStack(spacing: 16) {
+            HStack(spacing: 6) {
+                Image(systemName: "waveform.and.mic")
+                    .foregroundColor(.caneBlue)
+                Text("Ask Cane")
+                    .font(.caption.bold())
+                    .foregroundColor(.caneBlue)
+                    .tracking(0.5)
+                Spacer()
+                Text(voiceStatusLabel)
+                    .font(.caption)
+                    .foregroundColor(voice.state == .wakeListening ? .green : Color(white: 0.50))
+            }
+
+            // Mic button with pulsing rings while capturing
+            Button(action: onVoiceTap) {
+                ZStack {
+                    if voice.state == .capturing {
+                        Circle()
+                            .stroke(Color.caneBlue.opacity(0.35), lineWidth: 3)
+                            .frame(width: 116, height: 116)
+                            .scaleEffect(micPulse ? 1.18 : 0.95)
+                            .opacity(micPulse ? 0.15 : 0.8)
+                            .animation(.easeOut(duration: 1.0).repeatForever(autoreverses: false),
+                                       value: micPulse)
+                        Circle()
+                            .stroke(Color.caneBlue.opacity(0.55), lineWidth: 3)
+                            .frame(width: 100, height: 100)
+                            .scaleEffect(micPulse ? 1.10 : 0.98)
+                            .animation(.easeOut(duration: 1.0).delay(0.25).repeatForever(autoreverses: false),
+                                       value: micPulse)
+                    }
+                    Circle()
+                        .fill(voice.state == .capturing ? Color.caneRed : Color.caneBlue)
+                        .frame(width: 88, height: 88)
+                        .shadow(color: (voice.state == .capturing ? Color.caneRed : Color.caneBlue).opacity(0.5),
+                                radius: micPulse && voice.state == .capturing ? 18 : 8)
+                    if voice.state == .thinking {
+                        ProgressView().tint(.white).scaleEffect(1.4)
+                    } else {
+                        Image(systemName: voice.state == .capturing ? "waveform" : "mic.fill")
+                            .font(.system(size: 32, weight: .semibold))
+                            .foregroundColor(.white)
+                    }
+                }
+            }
+            .disabled(voice.state == .thinking)
+            .onAppear { micPulse = true }
+            .accessibilityLabel(voice.state == .capturing
+                ? "Listening. Tap to finish, or just stop talking."
+                : "Ask Cane a question by voice")
+            .accessibilityHint("Say Hey Cane, or tap. Try: what's around me, or: what's happening right now")
+
+            // Live transcript while capturing
+            if voice.state == .capturing {
+                Text(voice.transcript.isEmpty ? "Listening…" : "“\(voice.transcript)”")
+                    .font(.subheadline.italic())
+                    .foregroundColor(.white)
+                    .multilineTextAlignment(.center)
+                    .transition(.opacity)
+            } else if voice.state == .denied {
+                Text("Microphone or speech access is off — enable both for CaneOS in iOS Settings.")
+                    .font(.caption)
+                    .foregroundColor(.orange)
+                    .multilineTextAlignment(.center)
+            } else if voice.state == .wakeListening && voice.lastReply.isEmpty {
+                Text("Say “Hey Cane” or double-pinch on your Watch — then ask “what's around me?” or “what's happening right now?”")
+                    .font(.caption)
+                    .foregroundColor(Color(white: 0.50))
+                    .multilineTextAlignment(.center)
+            }
+
+            // Last answer bubble
+            if !voice.lastReply.isEmpty && voice.state != .capturing {
+                HStack(alignment: .top, spacing: 10) {
+                    Image(systemName: "quote.opening")
+                        .font(.caption)
+                        .foregroundColor(.caneBlue)
+                        .padding(.top, 3)
+                    Text(voice.lastReply)
+                        .font(.subheadline)
+                        .foregroundColor(Color(white: 0.85))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .padding(12)
+                .background(Color.caneNavy.opacity(0.7))
+                .cornerRadius(12)
+                .accessibilityLabel("CaneOS said: \(voice.lastReply)")
+            }
+        }
+        .padding(18)
+        .background(Color.caneCard)
+        .cornerRadius(20)
+    }
+
+    private var voiceStatusLabel: String {
+        switch voice.state {
+        case .idle:          return "Starting…"
+        case .wakeListening: return "● Waiting for “Hey Cane”"
+        case .capturing:     return "Listening…"
+        case .thinking:      return "Thinking…"
+        case .denied:        return "Permission needed"
         }
     }
 
@@ -600,16 +773,76 @@ struct SettingsView: View {
     let isScanning: Bool
     let onScan: () -> Void
     let onTestHaptic: (HapticSensorDirection) -> Void
-    let onSimulate: (HapticSensorDirection) async -> Bool
 
     @State private var lastTestSent: HapticSensorDirection?
-    @State private var isSimulating = false
-    @State private var simulateResult: String?
 
     var body: some View {
         ZStack {
             Color.caneNavy.ignoresSafeArea()
             List {
+                // MARK: Account (profile + Atlas sync; sign-in itself
+                // happens on the launch screen, before the app is shown)
+                Section {
+                    HStack(spacing: 12) {
+                        if let picture = auth.userPicture {
+                            AsyncImage(url: picture) { image in
+                                image.resizable()
+                            } placeholder: {
+                                Circle().fill(Color(white: 0.20))
+                            }
+                            .frame(width: 44, height: 44)
+                            .clipShape(Circle())
+                            .overlay(Circle().stroke(Color.caneBlue.opacity(0.6), lineWidth: 1.5))
+                        }
+                        VStack(alignment: .leading, spacing: 5) {
+                            if let name = auth.userName {
+                                Text(name)
+                                    .font(.body.weight(.semibold))
+                                    .foregroundColor(.white)
+                            }
+                            if let email = auth.userEmail {
+                                Text(email)
+                                    .font(.caption)
+                                    .foregroundColor(Color(white: 0.55))
+                            }
+                            Text("Requests verified by Auth0 · data in MongoDB Atlas")
+                                .font(.system(size: 10))
+                                .foregroundColor(Color(white: 0.40))
+                        }
+                    }
+                    .padding(.vertical, 2)
+                    .listRowBackground(Color.caneCard)
+
+                    Button {
+                        Task { await auth.syncToCloud() }
+                    } label: {
+                        HStack(spacing: 8) {
+                            if auth.isSyncing {
+                                ProgressView().tint(.caneBlue)
+                            } else {
+                                Image(systemName: "arrow.triangle.2.circlepath")
+                                    .foregroundColor(.caneBlue)
+                            }
+                            Text(auth.isSyncing ? "Syncing…" : "Sync now")
+                                .foregroundColor(.white)
+                        }
+                    }
+                    .disabled(auth.isSyncing)
+                    .listRowBackground(Color.caneCard)
+                    .accessibilityLabel("Sync contacts and settings to cloud")
+
+                    Button(role: .destructive) {
+                        Task { await auth.logout() }
+                    } label: {
+                        Text("Sign Out")
+                            .frame(maxWidth: .infinity, alignment: .center)
+                            .font(.body.weight(.semibold))
+                    }
+                    .listRowBackground(Color.caneCard)
+                } header: {
+                    sectionHeader(icon: "person.crop.circle.fill", title: "Account")
+                }
+
                 // MARK: Mode (both roles) — switchable anytime
                 Section {
                     Picker("Mode", selection: Binding(
@@ -679,45 +912,6 @@ struct SettingsView: View {
                     } header: {
                         sectionHeader(icon: "speaker.wave.2.fill", title: "Audio")
                     }
-
-                    // MARK: Location sharing (primary role only)
-                    Section {
-                        Toggle(isOn: $settings.locationSharingEnabled) {
-                            VStack(alignment: .leading, spacing: 4) {
-                                Text("Share Live Location")
-                                    .font(.body.weight(.semibold))
-                                    .foregroundColor(.white)
-                                Text("Lets your support partner see where you are on their map")
-                                    .font(.caption)
-                                    .foregroundColor(Color(white: 0.55))
-                            }
-                        }
-                        .tint(.caneBlue)
-                        .listRowBackground(Color.caneCard)
-                        .accessibilityLabel("Live location sharing \(settings.locationSharingEnabled ? "on" : "off")")
-                        .accessibilityHint("When on, your support partner can follow your location on a map. Turn off anytime.")
-
-                        HStack {
-                            VStack(alignment: .leading, spacing: 4) {
-                                Text("Your share code")
-                                    .font(.body.weight(.semibold))
-                                    .foregroundColor(.white)
-                                Text("Your support partner enters this in their app")
-                                    .font(.caption)
-                                    .foregroundColor(Color(white: 0.55))
-                            }
-                            Spacer()
-                            Text(settings.shareCode)
-                                .font(.system(size: 20, weight: .bold, design: .monospaced))
-                                .foregroundColor(.caneBlue)
-                                .textSelection(.enabled)
-                        }
-                        .listRowBackground(Color.caneCard)
-                        .accessibilityElement(children: .combine)
-                        .accessibilityLabel("Your share code is \(settings.shareCode.map(String.init).joined(separator: " "))")
-                    } header: {
-                        sectionHeader(icon: "location.fill", title: "Location Sharing")
-                    }
                 }
 
                 if settings.userRole == .support {
@@ -746,111 +940,8 @@ struct SettingsView: View {
                     }
                 }
 
-                // MARK: Account (profile + Atlas sync; sign-in itself
-                // happens on the launch screen, before the app is shown)
-                Section {
-                    HStack(spacing: 12) {
-                        if let picture = auth.userPicture {
-                            AsyncImage(url: picture) { image in
-                                image.resizable()
-                            } placeholder: {
-                                Circle().fill(Color(white: 0.20))
-                            }
-                            .frame(width: 44, height: 44)
-                            .clipShape(Circle())
-                            .overlay(Circle().stroke(Color.caneBlue.opacity(0.6), lineWidth: 1.5))
-                        }
-                        VStack(alignment: .leading, spacing: 5) {
-                            if let name = auth.userName {
-                                Text(name)
-                                    .font(.body.weight(.semibold))
-                                    .foregroundColor(.white)
-                            }
-                            if let email = auth.userEmail {
-                                Text(email)
-                                    .font(.caption)
-                                    .foregroundColor(Color(white: 0.55))
-                            }
-                            Text("Requests verified by Auth0 · data in MongoDB Atlas")
-                                .font(.system(size: 10))
-                                .foregroundColor(Color(white: 0.40))
-                        }
-                    }
-                    .padding(.vertical, 2)
-                    .listRowBackground(Color.caneCard)
-
-                    Button {
-                        Task { await auth.syncToCloud() }
-                    } label: {
-                        HStack(spacing: 8) {
-                            if auth.isSyncing {
-                                ProgressView().tint(.caneBlue)
-                            } else {
-                                Image(systemName: "arrow.triangle.2.circlepath")
-                                    .foregroundColor(.caneBlue)
-                            }
-                            Text(auth.isSyncing ? "Syncing…" : "Sync now")
-                                .foregroundColor(.white)
-                        }
-                    }
-                    .disabled(auth.isSyncing)
-                    .listRowBackground(Color.caneCard)
-                    .accessibilityLabel("Sync contacts and settings to cloud")
-
-                    Button(role: .destructive) {
-                        Task { await auth.logout() }
-                    } label: {
-                        Text("Sign Out")
-                            .frame(maxWidth: .infinity, alignment: .center)
-                            .font(.body.weight(.semibold))
-                    }
-                    .listRowBackground(Color.caneCard)
-                } header: {
-                    sectionHeader(icon: "person.crop.circle.fill", title: "Account")
-                }
-
                 // MARK: Testing & demo tools (both roles)
                 Section {
-                    // Full end-to-end rehearsal: fake ToF data on the Python
-                    // backend → real pipeline → narration + Watch buzz arrive
-                    // over the WebSockets like any genuine event.
-                    Button {
-                        guard !isSimulating else { return }
-                        isSimulating = true
-                        simulateResult = nil
-                        let direction = HapticSensorDirection.allCases.randomElement()!
-                        Task {
-                            let ok = await onSimulate(direction)
-                            isSimulating = false
-                            simulateResult = ok
-                                ? "Sent \(direction.rawValue) — listen for the narration and buzz"
-                                : "Couldn't reach the backend — is the Python server running?"
-                        }
-                    } label: {
-                        HStack(spacing: 10) {
-                            if isSimulating {
-                                ProgressView().tint(.white)
-                            } else {
-                                Image(systemName: "bolt.fill")
-                            }
-                            VStack(alignment: .leading, spacing: 3) {
-                                Text(isSimulating ? "Simulating…" : "Simulate Hazard Event")
-                                    .font(.body.weight(.semibold))
-                                if let result = simulateResult {
-                                    Text(result)
-                                        .font(.caption)
-                                        .foregroundColor(Color(white: 0.75))
-                                }
-                            }
-                            Spacer()
-                        }
-                        .foregroundColor(.white)
-                        .padding(.vertical, 4)
-                    }
-                    .listRowBackground(Color.caneBlue.opacity(isSimulating ? 0.4 : 0.85))
-                    .accessibilityLabel("Simulate a hazard event")
-                    .accessibilityHint("Fakes a sensor reading on the backend. A spoken description and a watch buzz should follow within a few seconds.")
-
                     // On-demand scene scan
                     Button(action: onScan) {
                         HStack(spacing: 10) {
@@ -896,6 +987,47 @@ struct SettingsView: View {
                     .listRowBackground(Color.caneCard)
                 } header: {
                     sectionHeader(icon: "wrench.and.screwdriver.fill", title: "Testing & Demo")
+                }
+
+                // MARK: Location sharing (primary role only)
+                if settings.userRole == .primary {
+                    Section {
+                        Toggle(isOn: $settings.locationSharingEnabled) {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("Share Live Location")
+                                    .font(.body.weight(.semibold))
+                                    .foregroundColor(.white)
+                                Text("Lets your support partner see where you are on their map")
+                                    .font(.caption)
+                                    .foregroundColor(Color(white: 0.55))
+                            }
+                        }
+                        .tint(.caneBlue)
+                        .listRowBackground(Color.caneCard)
+                        .accessibilityLabel("Live location sharing \(settings.locationSharingEnabled ? "on" : "off")")
+                        .accessibilityHint("When on, your support partner can follow your location on a map. Turn off anytime.")
+
+                        HStack {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("Your share code")
+                                    .font(.body.weight(.semibold))
+                                    .foregroundColor(.white)
+                                Text("Your support partner enters this in their app")
+                                    .font(.caption)
+                                    .foregroundColor(Color(white: 0.55))
+                            }
+                            Spacer()
+                            Text(settings.shareCode)
+                                .font(.system(size: 20, weight: .bold, design: .monospaced))
+                                .foregroundColor(.caneBlue)
+                                .textSelection(.enabled)
+                        }
+                        .listRowBackground(Color.caneCard)
+                        .accessibilityElement(children: .combine)
+                        .accessibilityLabel("Your share code is \(settings.shareCode.map(String.init).joined(separator: " "))")
+                    } header: {
+                        sectionHeader(icon: "location.fill", title: "Location Sharing")
+                    }
                 }
             }
             .listStyle(.plain)

@@ -9,6 +9,10 @@ final class AudioPlaybackManager: NSObject, AVAudioPlayerDelegate {
     // before" callback) never talk over each other.
     private var pending: [Data] = []
 
+    /// True while narration audio is playing or queued — the voice assistant
+    /// checks this so our own TTS can't trigger the wake word.
+    var isAudioPlaying: Bool { player?.isPlaying == true || !pending.isEmpty }
+
     private override init() {
         super.init()
         configureSession()
@@ -17,9 +21,12 @@ final class AudioPlaybackManager: NSObject, AVAudioPlayerDelegate {
     private func configureSession() {
         do {
             let session = AVAudioSession.sharedInstance()
-            // .allowBluetoothA2DP routes to Bluetooth headphones/speakers;
-            // .duckOthers softens any other audio (e.g. music) while alerts play
-            try session.setCategory(.playback, options: [.allowBluetoothA2DP, .duckOthers])
+            // .playAndRecord so the voice assistant's mic tap and narration
+            // playback share one session; .defaultToSpeaker keeps playback
+            // loud (not the earpiece); .allowBluetoothA2DP routes to
+            // Bluetooth headphones; .duckOthers softens other audio.
+            try session.setCategory(.playAndRecord,
+                                    options: [.allowBluetoothA2DP, .defaultToSpeaker, .duckOthers])
             try session.setActive(true)
         } catch {
             print("Audio session error: \(error.localizedDescription)")
