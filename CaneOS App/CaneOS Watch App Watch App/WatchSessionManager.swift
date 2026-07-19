@@ -74,6 +74,16 @@ final class WatchSessionManager: NSObject, ObservableObject, WCSessionDelegate {
     }
 
     private func handle(_ message: [String: Any]) {
+        // Voice mirror updates from the phone (state / live transcript / answer)
+        if let voiceState = message["voiceState"] as? String {
+            WatchVoiceManager.shared.applyRemoteState(voiceState)
+        }
+        if let voiceTranscript = message["voiceTranscript"] as? String {
+            WatchVoiceManager.shared.applyRemoteTranscript(voiceTranscript)
+        }
+        if let voiceReply = message["voiceReply"] as? String {
+            WatchVoiceManager.shared.applyReply(voiceReply)
+        }
         DispatchQueue.main.async {
             if let type = message["type"] as? String {
                 switch type {

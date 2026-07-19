@@ -12,6 +12,10 @@ final class PhoneSessionManager: NSObject, ObservableObject, WCSessionDelegate {
     /// double-pinch gesture; scan_now from the Watch's scan button.
     var onVoiceWake: (() -> Void)?
     var onWatchScanRequest: (() -> Void)?
+    /// Voice session control from the Watch: "start" / "stop" / "cancel".
+    var onVoiceControl: ((String) -> Void)?
+    /// Raw Watch-mic audio chunks (16 kHz mono Int16 PCM).
+    var onVoiceAudio: ((Data) -> Void)?
 
     private override init() {
         super.init()
@@ -73,6 +77,10 @@ final class PhoneSessionManager: NSObject, ObservableObject, WCSessionDelegate {
     // MARK: WCSessionDelegate
 
     func session(_ session: WCSession, didReceiveMessage message: [String: Any]) {
+        if let control = message["voice"] as? String {
+            DispatchQueue.main.async { self.onVoiceControl?(control) }
+            return
+        }
         guard let command = message["command"] as? String else { return }
         DispatchQueue.main.async {
             switch command {
@@ -81,6 +89,17 @@ final class PhoneSessionManager: NSObject, ObservableObject, WCSessionDelegate {
             default: break
             }
         }
+    }
+
+    /// Watch-mic audio stream (each chunk is one converted PCM buffer).
+    func session(_ session: WCSession, didReceiveMessageData messageData: Data) {
+        DispatchQueue.main.async { self.onVoiceAudio?(messageData) }
+    }
+
+    /// Mirrors voice-assistant state/transcript/answers to the Watch UI.
+    func sendVoiceUpdate(_ payload: [String: Any]) {
+        guard WCSession.default.isReachable else { return }
+        WCSession.default.sendMessage(payload, replyHandler: nil)
     }
 
     func session(_ session: WCSession, activationDidCompleteWith state: WCSessionActivationState, error: Error?) {
