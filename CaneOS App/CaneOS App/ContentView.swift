@@ -67,8 +67,6 @@ struct ContentView: View {
     @State private var isScanning          = false
     @State private var isHardwareConnected = false
     @State private var sosErrorMessage: String?
-    @State private var pendingSOSIncidentId: UUID?
-    @State private var lastSOSAt: Date?
     @State private var smsCompose: SMSCompose?
 
     @StateObject private var voice = VoiceAssistantManager()
@@ -256,7 +254,7 @@ struct ContentView: View {
         }
         hapticsConnection.connect(to: Config.hapticsWebSocketURL)
 
-        // /ws/hazards: richer, backend-throttled. Drives the UI, TTS, SOS,
+        // /ws/hazards: richer, backend-throttled. Drives the UI, TTS,
         // and incident history.
         hazardsConnection.onConnectionChange = { connected in
             isHardwareConnected = connected
@@ -377,39 +375,21 @@ struct ContentView: View {
             urgency:    hazard.urgency
         )
 
-        if hazard.urgency == "high" {
-            // High-urgency hazards trigger the SOS flow, which fetches location
-            // anyway to send with the alert -- reuse that fetch for the incident's
-            // location snapshot instead of requesting location twice.
-            pendingSOSIncidentId = incidentId
-        } else {
-            // Best-effort geolocation snapshot for the History entry. Failures
-            // here (permission denied, no fix yet) are expected and non-fatal,
-            // so we stay silent rather than alerting for every logged incident.
-            Task {
-                if let location = try? await sosManager.requestLocation() {
-                    incidents.attachLocation(location, toIncidentWithId: incidentId)
-                    await announceRepeatHazardIfAny(hazard, at: location, incidentId: incidentId)
-                }
+        // Best-effort geolocation snapshot for the History entry. Failures
+        // here (permission denied, no fix yet) are expected and non-fatal,
+        // so we stay silent rather than alerting for every logged incident.
+        Task {
+            if let location = try? await sosManager.requestLocation() {
+                incidents.attachLocation(location, toIncidentWithId: incidentId)
+                await announceRepeatHazardIfAny(hazard, at: location, incidentId: incidentId)
             }
         }
 
+        // SOS is manual-only (hold button on the Safety tab or the watch):
+        // hazard detections — even high-urgency ones — narrate and haptic
+        // but never raise the SOS alert.
         guard settings.audioEnabled else { return }
-        let desc = hazard.spokenDescription
-
-        if hazard.urgency == "high" {
-            // TTS and SOS fire in parallel — no countdown; the alert goes
-            // out immediately while the narration plays.
-            phoneSession.sendSOSAlert()
-            // Auto-firing SOS/SMS on every high-danger classification is
-            // disabled for now -- SMS should only go out from the manual
-            // hold-button (fireManualSOS). Uncomment the line below to
-            // restore automatic SMS on high-danger hazards.
-            // autoFireSOS()
-            Task { await speakAndPlay(desc) }
-        } else {
-            Task { await speakAndPlay(desc) }
-        }
+        Task { await speakAndPlay(hazard.spokenDescription) }
     }
 
     /// Checks Atlas ($geoNear on the incident log) for past incidents of the
@@ -439,31 +419,16 @@ struct ContentView: View {
         Task { await fireSOS() }
     }
 
-    /// Hazard-triggered SOS: also fires immediately (no countdown), but at
-    /// most once every 2 minutes so a burst of high-urgency detections
-    /// can't spam the emergency contacts with repeated alerts.
-    ///
-    /// Currently unused -- kept here (and the call site above, commented
-    /// out) in case automatic SMS-on-high-danger is wanted again later.
-    // private func autoFireSOS() {
-    //     if let last = lastSOSAt, Date().timeIntervalSince(last) < 120 { return }
-    //     Task { await fireSOS() }
-    // }
-
     private func fireSOS() async {
-        lastSOSAt = Date()
         do {
             let location = try await sosManager.requestLocation()
 
-            // Attach this location snapshot to History: either the hazard
-            // incident that triggered this SOS, or (for a manually-held SOS
-            // button with no preceding hazard) a fresh "manual SOS" entry.
-            let isAutoTriggered = pendingSOSIncidentId != nil
-            let incidentId = pendingSOSIncidentId ?? incidents.log(
+            // Attach this location snapshot to a fresh "manual SOS" History
+            // entry — SOS only ever comes from the hold button now.
+            let incidentId = incidents.log(
                 hazardType: "manual_sos", direction: "-", urgency: "high"
             )
             incidents.attachLocation(location, toIncidentWithId: incidentId)
-            pendingSOSIncidentId = nil
 
             let contacts = contactsManager.contacts
             guard !contacts.isEmpty else {
@@ -491,8 +456,8 @@ struct ContentView: View {
             try await BackendClient.shared.sendSOS(
                 contactGatewayAddresses: contacts.map(\.smsGatewayAddress),
                 location: location,
-                hazardType: isAutoTriggered ? (lastHazard?.hazardType ?? "hazard") : "manual_sos",
-                direction: isAutoTriggered ? (lastHazard?.direction.rawValue ?? "-") : "-",
+                hazardType: "manual_sos",
+                direction: "-",
                 urgency: "high"
             )
 
