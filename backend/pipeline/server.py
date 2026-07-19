@@ -4,18 +4,28 @@ to, plus a health check.
 
 WebSocket contract (fixed -- the Swift app decodes exactly this shape, no
 extra fields): {hazard_type, direction, urgency, spoken_description}.
+
+/ws/hazards is bidirectional: besides broadcasting ambient hazard
+narration (unchanged), it also receives on-demand voice questions from
+the connected Swift client and replies on that same connection -- see
+_handle_hazards_message() below.
 """
 
 from __future__ import annotations
 
 import asyncio
 import collections
+import json
 import logging
 import socket
 import time
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+
+from pipeline import conversation_memory
+from pipeline.detection_input import capture_frame
+from pipeline.gemini_stage import answer_query
 
 logger = logging.getLogger(__name__)
 
@@ -51,23 +61,43 @@ class ConnectionManager:
 
     def __init__(self) -> None:
         self._connections: list[WebSocket] = []
+        # One lock per connection, guarding every send on that socket.
+        # /ws/hazards now has two independent sources of outbound
+        # messages on the same connection -- narration_worker.py's
+        # ambient broadcast_hazard() (its own background task) and a
+        # direct query reply from this connection's own receive loop
+        # (see _handle_hazards_message()). Two tasks calling send() on one
+        # raw WebSocket at the same time isn't safe, so every send funnels
+        # through send_to() below, which serializes on this lock.
+        self._locks: dict[WebSocket, asyncio.Lock] = {}
 
     async def connect(self, websocket: WebSocket) -> None:
         await websocket.accept()
         self._connections.append(websocket)
+        self._locks[websocket] = asyncio.Lock()
         logger.info("Client connected (%d total)", len(self._connections))
 
     def disconnect(self, websocket: WebSocket) -> None:
         if websocket in self._connections:
             self._connections.remove(websocket)
+        self._locks.pop(websocket, None)
         logger.info("Client disconnected (%d total)", len(self._connections))
+
+    async def send_to(self, websocket: WebSocket, message: dict) -> None:
+        """Sends to exactly one connection, serialized against any other
+        concurrent send (e.g. an ambient broadcast) on that same socket."""
+        lock = self._locks.get(websocket)
+        if lock is None:
+            return  # already disconnected
+        async with lock:
+            await websocket.send_json(message)
 
     async def broadcast(self, message: dict) -> None:
         # Iterate over a copy since a failed send mutates self._connections
         # via disconnect() during iteration.
         for websocket in list(self._connections):
             try:
-                await websocket.send_json(message)
+                await self.send_to(websocket, message)
             except Exception as exc:  # noqa: BLE001 - a dead socket shouldn't kill the broadcast
                 logger.warning("Failed to send to a client, dropping it: %s", exc)
                 self.disconnect(websocket)
@@ -81,15 +111,70 @@ async def health() -> dict:
     return {"status": "ok"}
 
 
+# "Hey Cane" on-demand voice Q&A rides on this same /ws/hazards connection
+# (per the Swift app's existing architecture) rather than a separate REST
+# call. Same fallback text gemini_stage.answer_query() uses internally for
+# Gemini failures -- kept as its own constant here since the failures this
+# guards against (Mongo, capture_frame) are outside answer_query() itself.
+_VOICE_QUERY_FALLBACK_ANSWER = "Sorry, I couldn't process that right now."
+
+
+async def _handle_hazards_message(websocket: WebSocket, raw: str) -> None:
+    """
+    Parses whatever text arrives on /ws/hazards. If it matches the voice
+    query shape the Swift app actually sends --
+    {"question": "...", "session_id": "..."} -- answers it and replies on
+    THIS connection with {"answer": "..."}, matching CaneMessage.swift's
+    CaneHazardChannelEvent decoder exactly (it checks for an "answer" key
+    before anything else, so this flat shape needs no discriminator).
+
+    Anything that isn't a well-formed query (bad JSON, wrong shape, or any
+    other traffic) is silently ignored -- same as the original
+    receive-only behavior, since this socket was never meant to validate
+    or react to arbitrary input.
+    """
+    try:
+        payload = json.loads(raw)
+    except ValueError:
+        return
+
+    if not isinstance(payload, dict):
+        return
+    question = payload.get("question")
+    session_id = payload.get("session_id")
+    if not isinstance(question, str) or not isinstance(session_id, str):
+        return
+
+    try:
+        recent_context = await conversation_memory.get_recent_context(session_id)
+        frame = capture_frame()
+        answer = await answer_query(frame, question, recent_context)
+        await conversation_memory.save_exchange(session_id, question, answer)
+    except Exception as exc:  # noqa: BLE001 - a bad query must not kill the connection
+        logger.error("Voice query handling failed, replying with fallback: %s", exc)
+        answer = _VOICE_QUERY_FALLBACK_ANSWER
+
+    try:
+        await manager.send_to(websocket, {"answer": answer})
+    except Exception as exc:  # noqa: BLE001 - a dead socket shouldn't crash the receive loop
+        logger.warning("Failed to send voice answer, client likely disconnected: %s", exc)
+
+
 @app.websocket("/ws/hazards")
 async def ws_hazards(websocket: WebSocket) -> None:
     await manager.connect(websocket)
     try:
         while True:
-            # This pipeline only ever pushes hazard events out; it doesn't
-            # currently act on anything the Swift client sends. We still
-            # need to await receive() to detect disconnects promptly.
-            await websocket.receive_text()
+            # Ambient hazard broadcasts (broadcast_hazard(), below) arrive
+            # on this same connection from narration_worker.py's own
+            # background task, entirely independent of this receive loop
+            # -- awaiting a query here never blocks those sends, since
+            # they don't go through this coroutine at all, and the
+            # ConnectionManager lock (see send_to()) only serializes the
+            # instant of actually writing to the socket, not the Gemini
+            # call that produces the answer.
+            raw = await websocket.receive_text()
+            await _handle_hazards_message(websocket, raw)
     except WebSocketDisconnect:
         manager.disconnect(websocket)
 
@@ -291,40 +376,6 @@ async def sos_relay(payload: dict) -> dict:
 
     sent = sum(1 for r in results if r["ok"])
     return {"sent": sent, "results": results}
-
-
-# ---------------------------------------------------------------------------
-# "Hey Cane" on-demand Q&A: a plain synchronous REST endpoint, not a
-# WebSocket -- one question in, one answer out, nothing queued or
-# broadcast. Deliberately independent of throttle.py/narration_queue.py/
-# narration_worker.py -- every explicit question gets answered, no
-# dedup/cooldown applies here (that's for the ambient hazard-narration
-# path, not something the user directly asked for).
-# ---------------------------------------------------------------------------
-
-from pydantic import BaseModel as _BaseModel
-
-from pipeline import conversation_memory as _conversation_memory
-from pipeline.detection_input import capture_frame as _query_capture_frame
-from pipeline.gemini_stage import answer_query as _answer_query
-
-
-class QueryRequest(_BaseModel):
-    question: str
-    session_id: str
-
-
-class QueryResponse(_BaseModel):
-    answer: str
-
-
-@app.post("/query")
-async def query(request: QueryRequest) -> QueryResponse:
-    recent_context = await _conversation_memory.get_recent_context(request.session_id)
-    frame = _query_capture_frame()
-    answer = await _answer_query(frame, request.question, recent_context)
-    await _conversation_memory.save_exchange(request.session_id, request.question, answer)
-    return QueryResponse(answer=answer)
 
 
 def get_local_ip() -> str:

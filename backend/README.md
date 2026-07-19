@@ -17,10 +17,11 @@ Four independent background tasks, all wired up in `pipeline/main.py`:
   `/ws/status`, completely independent of the three paths above (see
   "Camera health monitoring" below).
 
-Alongside these background tasks, `POST /query` (added 2026-07-18) is a
-plain synchronous REST endpoint for the "Hey Cane" on-demand Q&A feature --
-see "On-demand Q&A" below. It's a one-question-one-answer request, not an
-ambient stream, so it isn't a background task at all.
+`/ws/hazards` is also bidirectional (added 2026-07-19): besides the
+ambient broadcasts above, it receives on-demand "Hey Cane" voice questions
+from the connected client and replies on that same connection -- see
+"On-demand Q&A" below. There's no separate task or endpoint for this; it's
+handled inline in the same connection's receive loop.
 
 Pipeline stages (see `pipeline/`):
 
@@ -43,7 +44,8 @@ Pipeline stages (see `pipeline/`):
    for overhead hazards (see below). Also holds `answer_query()`, a
    separate open-ended-question prompt/flow for "Hey Cane" (see below) --
    a different prompt and no JSON mode, but the same client/model and
-   retry-then-fallback pattern as `analyze_hazard()`.
+   retry-then-fallback pattern as `analyze_hazard()`. Called from
+   `server.py`'s `/ws/hazards` handler, not from a REST endpoint.
 6. **narration_templates.py** -- fixed spoken-description templates for
    overhead hazards, picked by distance, no Gemini call involved.
 7. **narration_worker.py** -- consumes `narration_queue`, runs the shared
@@ -57,10 +59,11 @@ Pipeline stages (see `pipeline/`):
    reflex path; never imports `throttle.py` or `gemini_stage.py` (the
    narration_queue push for "up" triggers is fire-and-forget and adds no
    dependency on either).
-10. **server.py** -- FastAPI app: `GET /health`, `WS /ws/hazards`,
-    `WS /ws/haptics`, `WS /ws/status` (each with their own connection
-    manager), and `POST /query` (plain synchronous REST, no connection
-    manager needed).
+10. **server.py** -- FastAPI app: `GET /health`, `WS /ws/hazards`
+    (bidirectional -- broadcasts ambient hazards AND receives/answers
+    on-demand voice questions), `WS /ws/haptics`, `WS /ws/status` -- each
+    connection type with its own `ConnectionManager`, which now also holds
+    a per-connection send lock (see "On-demand Q&A" below for why).
 11. **heartbeat_input.py** -- mock periodic camera heartbeat, independent
     of detection events; the integration point for the real hardware
     heartbeat feed.
@@ -74,8 +77,9 @@ Pipeline stages (see `pipeline/`):
 14. **conversation_memory.py** -- MongoDB-backed conversation history for
     the "Hey Cane" on-demand Q&A feature (see below); the only module that
     talks to Mongo.
-15. **main.py** -- wires all four background tasks together (`POST /query`
-    needs no task of its own -- it's a plain request/response endpoint).
+15. **main.py** -- wires all four background tasks together (the voice
+    query path needs no task of its own -- it's handled inline in
+    `/ws/hazards`'s existing receive loop).
 
 ## macOS / Linux setup
 
@@ -290,35 +294,63 @@ the same idea for testing the explicit-error path instead of silence.
 hardware's heartbeat channel, yielding the same
 `{"status": "ok"|"error", "timestamp": ...}` shape.
 
-## On-demand Q&A ("Hey Cane", `POST /query`)
+## On-demand Q&A ("Hey Cane", over `/ws/hazards`)
 
 A Swift teammate handles wake-word detection ("Hey Cane"), speech-to-text,
 and speaking the final answer via ElevenLabs. This backend's job is just
 the middle of that pipeline: given a question, answer it about the
 current scene.
 
-This is a **plain synchronous REST endpoint, not a WebSocket** -- one
-question in, one answer out, nothing queued or broadcast. That matches the
-feature itself (a one-off question-answer exchange, not an ambient
-stream) and keeps it structurally distinct from `/ws/hazards`,
-`/ws/haptics`, and `/ws/status`.
+**This rides on the existing `/ws/hazards` WebSocket connection, not a
+separate endpoint** (changed 2026-07-19 -- it was originally a standalone
+`POST /query` REST endpoint, but the Swift app's actual architecture sends
+voice questions and expects answers back over the same socket it's
+already holding open for ambient hazard narration, so the backend now
+matches that instead of requiring a second connection). `/ws/hazards` is
+bidirectional: it still broadcasts ambient hazard JSON exactly as before
+(unaffected), and it *also* reads incoming text frames, answering any that
+match the query shape:
 
 ```
-POST /query
-{"question": "what's around me right now?", "session_id": "user_abc123"}
+Swift app sends, over the open /ws/hazards connection:
+{"question": "what's around me right now?", "session_id": "user_a1b2c3d4e5f6"}
 
--> {"answer": "You're in a hallway with a door open on your right and a chair a few feet ahead."}
+Backend replies on that SAME connection:
+{"answer": "You're in a hallway with a door open on your right and a chair a few feet ahead."}
 ```
 
-What happens per request: `conversation_memory.get_recent_context()` pulls
-that session's last few exchanges -> `detection_input.capture_frame()`
-grabs the current frame (same function the hazard path already uses, not
-duplicated) -> `gemini_stage.answer_query()` sends the frame + question +
-context to Gemini with an open-ended prompt (a different prompt from
-`analyze_hazard()`'s structured hazard-JSON one -- no fixed response
-shape, no JSON mode, just a natural-language answer meant to be read
-aloud) -> `conversation_memory.save_exchange()` persists the new exchange
--> the answer goes straight back in the HTTP response.
+`session_id` is whatever stable per-install identifier the Swift app
+generates and persists (no cross-session memory -- context is scoped
+entirely by this value). Anything that arrives on `/ws/hazards` that
+*isn't* this exact shape (bad JSON, unrelated fields, or anything else) is
+silently ignored, same as the connection's original disconnect-detection-only
+behavior for non-query traffic.
+
+What happens per query (`server._handle_hazards_message()`):
+`conversation_memory.get_recent_context()` pulls that session's last few
+exchanges -> `detection_input.capture_frame()` grabs the current frame
+(same function the hazard path already uses, not duplicated) ->
+`gemini_stage.answer_query()` sends the frame + question + context to
+Gemini with an open-ended prompt (different from `analyze_hazard()`'s
+structured hazard-JSON one -- no fixed response shape, no JSON mode, just
+a natural-language answer meant to be read aloud) ->
+`conversation_memory.save_exchange()` persists the new exchange -> the
+answer is sent back directly to the connection that asked, not broadcast
+to every connected client. Any failure anywhere in that chain (Gemini,
+Mongo, frame capture) is caught and replies with a fallback answer instead
+of raising -- a bad query must never kill the WebSocket connection.
+
+**Concurrency note**: `/ws/hazards` now has two independent sources of
+outbound messages on one connection -- `narration_worker.py`'s ambient
+`broadcast_hazard()` (its own background task) and a direct query reply
+from that connection's own receive loop. Two tasks calling `send()` on one
+raw WebSocket at the same time isn't safe, so `ConnectionManager` now
+holds a per-connection `asyncio.Lock`, and every send (broadcast or direct
+reply) goes through `ConnectionManager.send_to()`, which serializes on it.
+This only serializes the instant of writing to the socket, not the Gemini
+call that produces the answer -- an in-flight query never blocks or delays
+an ambient hazard broadcast to *other* connections, or to this one once
+the lock is free.
 
 **Fully independent of the throttle/narration path**: no
 `HazardThrottle`, no `narration_queue`, no dedup or cooldown of any kind.
@@ -336,27 +368,28 @@ A new `conversations` collection stores only explicit Q&A exchanges
 (`session_id`, `question`, `answer`, `timestamp`) -- ambient hazard
 narrations are never written here.
 
-**Integration point for the Swift side**: generate and persist a stable
-`session_id` per user/session (e.g. once per app install, or once per
-"conversation" if you want context to reset periodically) and pass it with
-every `/query` request. Context is scoped entirely by `session_id` -- there's
-no cross-session memory.
+**Manual test path**: with the server running, connect `test_client.py`
+(it already listens on `/ws/hazards`) and, separately, send a question
+over that same connection -- e.g. with `websockets` in a Python shell:
 
-**Manual test path**:
+```python
+import asyncio, websockets, json
 
-```bash
-source venv/bin/activate
-curl -X POST http://localhost:8765/query \
-  -H "Content-Type: application/json" \
-  -d '{"question": "what is in front of me?", "session_id": "test-session-1"}'
+async def ask():
+    async with websockets.connect("ws://localhost:8765/ws/hazards") as ws:
+        await ws.send(json.dumps({"question": "what is in front of me?", "session_id": "test-session-1"}))
+        print(await ws.recv())
+
+asyncio.run(ask())
 ```
 
 You should get back `{"answer": "..."}` with no prior context (a new
-`session_id`). POST a second question with the *same* `session_id` and the
-first exchange should now be part of the context Gemini sees -- add a
-temporary `logger.info(prompt)` in `gemini_stage._build_query_prompt()`
-(or right before the Gemini call) if you want to see the assembled prompt
-directly while verifying this.
+`session_id`). Run it again with the *same* `session_id` and the first
+exchange should now be part of the context Gemini sees -- add a temporary
+`logger.info(prompt)` in `gemini_stage._build_query_prompt()` (or right
+before the Gemini call) if you want to see the assembled prompt directly
+while verifying this. While a question is in flight, `test_client.py`
+should keep receiving any ambient hazard broadcasts normally, unaffected.
 
 ## Testing the throttle specifically
 
